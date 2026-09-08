@@ -1,0 +1,874 @@
+#!/usr/bin/env bash
+#
+# vm-claude — run Claude Code inside a microsandbox microVM, anywhere.
+#
+# Isolates Claude Code from the host: only the current project dir is mounted
+# (rw) into the guest at /workspace. Auth/config/session state persist in the
+# VM's root disk, keyed per project, so resuming is instant.
+#
+# Docs: https://docs.microsandbox.dev/examples/agents/claude-code
+#
+# Usage:
+#   vm-claude                 # run claude in a VM for $PWD
+#   vm-claude --shell         # drop into a shell in the VM instead
+#   vm-claude --stop          # stop this project's VM
+#   vm-claude --rm            # stop + delete VM (wipes its auth/session state)
+#   vm-claude --sign-on-exit  # sign the VM's commits on the host when it exits
+#   vm-claude --no-clip       # disable the clipboard bridge (on by default)
+#   vm-claude --worktree NAME # run in a git worktree (created if missing) in the
+#                             # same VM; gitignored files are copied in on create
+#   vm-claude -- <args...>    # pass args straight to `claude`
+#
+# claude runs with --dangerously-skip-permissions by default: the microVM is
+# already the sandbox, so a second permission prompt inside it buys little.
+# Set CLAUDE_VM_SKIP_PERMISSIONS=0 to get the normal prompts back.
+#
+# Env overrides:
+#   CLAUDE_VM_VERSION   npm version of @anthropic-ai/claude-code, installed on
+#                       every start/resume (default "latest"; pin to e.g. 2.1.235)
+#   CLAUDE_VM_IMAGE     base OCI image           (default node:24-bookworm-slim)
+#   CLAUDE_VM_CPUS      vCPUs                     (default 2)
+#   CLAUDE_VM_MEMORY    RAM                       (default 4G)
+#   CLAUDE_VM_DISK      root disk                 (default 4G)
+#   CLAUDE_VM_MOUNT     host dir to mount as /workspace (default: $PWD)
+#   CLAUDE_VM_SKIP_PERMISSIONS  1 (default) passes --dangerously-skip-permissions
+#   CLAUDE_VM_SIGN_ON_EXIT      1/0 forces --sign-on-exit on/off (default: on
+#                               when the host has commit.gpgsign=true)
+#   CLAUDE_VM_TZ        timezone for the guest    (default: the host's)
+#   CLAUDE_VM_CONFIG    1 (default) ships a safe subset of ~/.claude into the
+#                       guest; 0 leaves the guest with a virgin config
+#   CLAUDE_VM_CONFIG_DIR    host config dir to copy from (default ~/.claude)
+#   CLAUDE_VM_CONFIG_ITEMS  space-separated allowlist of entries to copy
+#   CLAUDE_VM_CONFIG_MAX_KB size ceiling for that payload  (default 120)
+#   CLAUDE_VM_SETTINGS_STRIP  settings.json keys to drop in the guest
+#                       (default "hooks statusLine"; "" keeps everything)
+#   CLAUDE_VM_CLIP      1 (default) bridges the macOS clipboard into the guest so
+#                       Claude's Ctrl-V image paste works, approving each paste
+#                       via a host dialog; 0 (or --no-clip) turns it off. macOS
+#                       host only; pngpaste is auto-installed via Homebrew.
+#   CLAUDE_VM_WORKTREE_DIR  subdir under the repo root that holds --worktree
+#                       checkouts (default ".vm-worktrees")
+
+set -euo pipefail
+
+VERSION="${CLAUDE_VM_VERSION:-latest}"
+# Default to the AWS ECR public mirror of Docker's official images: anonymous
+# pull, no Docker Hub rate limit / 401. Override with a Hub tag if you prefer.
+IMAGE="${CLAUDE_VM_IMAGE:-public.ecr.aws/docker/library/node:24-bookworm-slim}"
+CPUS="${CLAUDE_VM_CPUS:-2}"
+MEMORY="${CLAUDE_VM_MEMORY:-4G}"
+DISK="${CLAUDE_VM_DISK:-4G}"
+MOUNT_DIR="${CLAUDE_VM_MOUNT:-$PWD}"
+SKIP_PERMISSIONS="${CLAUDE_VM_SKIP_PERMISSIONS:-1}"
+HEAD_BEFORE=""
+
+# --worktree: run in a git worktree of the mounted repo instead of at its root.
+# The worktree lives UNDER the repo root (so it's inside the existing /workspace
+# mount and reuses the same VM), and sign-on-exit operates on it rather than the
+# root. HOST_GIT_WORKTREE is the host repo path the signing hook targets; it
+# defaults to MOUNT_DIR and is repointed at the worktree when --worktree is used.
+WORKTREE_NAME=""
+WORKTREE_SUBDIR="${CLAUDE_VM_WORKTREE_DIR:-.vm-worktrees}"
+HOST_GIT_WORKTREE=""
+
+# Default sign-on-exit ON when the host is already set up to sign commits
+# (commit.gpgsign=true) -- otherwise a VM session silently leaves a run of
+# unsigned commits behind, which is exactly what that host wanted to avoid. An
+# explicit CLAUDE_VM_SIGN_ON_EXIT wins; so do --sign-on-exit / --no-sign-on-exit.
+if [ -n "${CLAUDE_VM_SIGN_ON_EXIT:-}" ]; then
+  SIGN_ON_EXIT="$CLAUDE_VM_SIGN_ON_EXIT"
+elif command -v git >/dev/null 2>&1 \
+  && [ "$(git config --global --type=bool --get commit.gpgsign 2>/dev/null)" = "true" ]; then
+  SIGN_ON_EXIT=1
+else
+  SIGN_ON_EXIT=0
+fi
+
+# Which of the host's ~/.claude to carry into the guest. An allowlist, for the
+# same reason host_git_config is one: everything not named here — credentials,
+# history, transcripts, other projects' state — stays on the host.
+CONFIG_SYNC="${CLAUDE_VM_CONFIG:-1}"
+CONFIG_SRC="${CLAUDE_VM_CONFIG_DIR:-$HOME/.claude}"
+CONFIG_ITEMS="${CLAUDE_VM_CONFIG_ITEMS:-CLAUDE.md settings.json keybindings.json agents commands skills hooks output-styles}"
+CONFIG_MAX_KB="${CLAUDE_VM_CONFIG_MAX_KB:-120}"
+CONFIG_B64=""
+
+# Top-level keys deleted from the shipped settings.json inside the guest. Both
+# defaults name host-side execution: `hooks` and `statusLine` run commands by
+# absolute path or host-only binary, none of which exist in the VM, so left in
+# they make every session event fire a hook that errors. This is a plain key
+# list, not tied to any particular config -- set it to "" to keep everything, or
+# add keys (e.g. "env") to drop more. Use `-` so an explicit "" means "keep all".
+CONFIG_STRIP="${CLAUDE_VM_SETTINGS_STRIP-hooks statusLine}"
+
+# --- clipboard bridge (opt-in) ---------------------------------------------
+# Claude Code reads a pasted image by shelling out to `xclip`/`wl-paste` in the
+# guest, which has no clipboard -- so image paste (Ctrl-V) is dead by default.
+# With --clip (or CLAUDE_VM_CLIP=1) we bridge it: a host watcher serves the
+# macOS pasteboard through a shared dir, and a shim named `xclip` in the guest
+# fetches it. Every fetch pops a host approval dialog, so a rogue guest can make
+# the prompt appear but can't read anything without a human click. The request
+# from the guest is what identifies which VM is asking, so this works no matter
+# how windows/panes are split -- something a host-side hotkey can't do.
+#
+# On by default; --no-clip (or CLAUDE_VM_CLIP=0) turns it off. macOS host only,
+# and images need `pngpaste`, which is auto-installed via Homebrew when missing
+# (like msb) -- if that can't happen, image paste degrades off and text still
+# works. The shared dir is an extra mount and mounts are fixed at boot, so
+# enabling it on a VM that was first booted without it needs `--rm` and a fresh
+# start; a resume that finds the bridge missing says so and carries on.
+CLIP_ENABLE="${CLAUDE_VM_CLIP:-1}"
+CLIP_EXPLICIT=0
+[ -n "${CLAUDE_VM_CLIP:-}" ] && CLIP_EXPLICIT=1
+WATCHER_PID=""
+
+# Guest shim: impersonates just enough of xclip(1) for Claude's paste probe.
+# The presence probe (TARGETS) is answered silently; each *content* fetch
+# round-trips to the host watcher, which asks the user. Written verbatim into
+# the guest at /usr/local/bin/xclip (nothing real is there to shadow).
+#
+# Read via `read -r -d ''` rather than "$(cat <<'EOS')": a heredoc inside command
+# substitution is mishandled by the bash 3.2 that ships with macOS. `read` hits
+# EOF and returns non-zero, hence the `|| true` under `set -e`.
+IFS= read -r -d '' CLIP_SHIM_SRC <<'EOS' || true
+#!/bin/sh
+# vm-claude clipboard shim (guest side). Serves the host pasteboard, gated by a
+# per-paste approval dialog the host watcher shows. See vm-claude for the design.
+CLIP="${VM_CLIP_DIR:-/run/vm-clip}"
+
+# No bridge mounted / no watcher running -> behave like an empty clipboard,
+# instantly, rather than hang on a round-trip that will never be answered.
+[ -e "$CLIP/ready" ] || exit 1
+
+target=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t) target="${2:-}"; shift 2 ;;
+    -selection) shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+# Drop a content-free trigger and wait for the host to answer. The trigger's
+# existence is the whole message; the watcher never reads its contents.
+roundtrip() {                       # $1 = probe|image|text
+  rm -f "$CLIP/$1.done" 2>/dev/null
+  : > "$CLIP/$1.req"
+  n=0
+  while [ "$n" -lt 300 ]; do        # ~30s ceiling (dialog itself times out first)
+    [ -e "$CLIP/$1.done" ] && { rm -f "$CLIP/$1.done"; return 0; }
+    n=$((n + 1)); sleep 0.1
+  done
+  return 1
+}
+
+case "$target" in
+  TARGETS)                          # silent presence probe, no dialog
+    roundtrip probe || exit 1
+    [ -e "$CLIP/has.png" ] && printf 'image/png\n'
+    [ -e "$CLIP/has.txt" ] && printf 'text/plain\n'
+    ;;
+  image/png)
+    roundtrip image || exit 1
+    [ -s "$CLIP/out.png" ] && exec cat "$CLIP/out.png"
+    exit 1 ;;
+  text/plain)
+    roundtrip text || exit 1
+    [ -s "$CLIP/out.txt" ] && exec cat "$CLIP/out.txt"
+    exit 1 ;;
+  *)
+    exit 1 ;;
+esac
+EOS
+
+# Host watcher (macOS). Bridges the pasteboard to the guest shim, prompting the
+# user before every content fetch. Security-critical invariants, all in one spot:
+#   - the guest can only create *.req TRIGGERS; their contents are never read.
+#   - everything handed back is staged in a host-only dir ($WORK) and renamed
+#     onto the same filesystem into the shared mount ($SHARED); a symlink the
+#     guest plants in $SHARED can't redirect our writes (rename replaces it).
+#   - the dialog string is composed here -- no guest bytes ever reach osascript.
+# Read via `read -r -d ''` for the same bash-3.2 reason as the shim above.
+IFS= read -r -d '' CLIP_WATCHER_SRC <<'EOW' || true
+#!/bin/sh
+set -eu
+SHARED="$1"; WORK="$2"; NAME="$3"
+mkdir -p "$SHARED" "$WORK"
+
+have_png=0
+if command -v pngpaste >/dev/null 2>&1; then
+  have_png=1
+else
+  echo "vm-claude clipboard: pngpaste not found (brew install pngpaste); image paste off, text still works." >&2
+fi
+
+# symlink-safe writes: stage in $WORK, rename onto the same fs into $SHARED.
+mark()   { : > "$WORK/.m" && mv -f "$WORK/.m" "$SHARED/$1"; }
+unmark() { rm -f "$SHARED/$1"; }
+
+ask() {  # $1 = image|text ; returns 0 on Allow. Text is host-composed only.
+  osascript -e "display dialog \"${NAME} wants to read your clipboard (${1}). Allow this paste?\" buttons {\"Deny\", \"Allow\"} default button \"Deny\" cancel button \"Deny\" with title \"vm-claude clipboard\" with icon caution giving up after 20" 2>/dev/null | grep -q "button returned:Allow"
+}
+
+cleanup() { rm -f "$SHARED/ready" 2>/dev/null || true; }
+trap 'cleanup; exit 0' TERM INT
+trap cleanup EXIT
+
+mark ready
+while [ -d "$SHARED" ]; do
+  # Self-terminate if the vm-claude that launched us is gone -- an orphan
+  # reparents to PID 1. Covers hard kills where our EXIT trap never fired, so a
+  # watcher can't outlive its session even when nothing gets to reap it.
+  [ "$(ps -o ppid= -p "$$" 2>/dev/null | tr -d ' ')" = 1 ] && { cleanup; exit 0; }
+  if [ -e "$SHARED/probe.req" ]; then
+    rm -f "$SHARED/probe.req"; unmark has.png; unmark has.txt
+    if [ "$have_png" = 1 ] && pngpaste "$WORK/c.png" >/dev/null 2>&1 && [ -s "$WORK/c.png" ]; then mark has.png; fi
+    if pbpaste 2>/dev/null | grep -q .; then mark has.txt; fi
+    mark probe.done
+  fi
+  if [ -e "$SHARED/image.req" ]; then
+    rm -f "$SHARED/image.req"; unmark out.png
+    if [ "$have_png" = 1 ] && ask image && pngpaste "$WORK/c.png" >/dev/null 2>&1 && [ -s "$WORK/c.png" ]; then
+      rm -f "$SHARED/out.png"; mv -f "$WORK/c.png" "$SHARED/out.png"
+    fi
+    mark image.done
+  fi
+  if [ -e "$SHARED/text.req" ]; then
+    rm -f "$SHARED/text.req"; unmark out.txt
+    if ask text && pbpaste > "$WORK/c.txt" 2>/dev/null; then
+      rm -f "$SHARED/out.txt"; mv -f "$WORK/c.txt" "$SHARED/out.txt"
+    fi
+    mark text.done
+  fi
+  sleep 0.15
+done
+EOW
+
+# --- resolve mount to an absolute path -------------------------------------
+MOUNT_DIR="$(cd "$MOUNT_DIR" && pwd)"
+
+# If inside a git repo, mount the repo ROOT (so .git is visible in the guest)
+# and remember the sub-path so we land in the same dir inside /workspace.
+SUBPATH=""
+if [ -z "${CLAUDE_VM_MOUNT:-}" ] && command -v git >/dev/null 2>&1; then
+  if root="$(cd "$MOUNT_DIR" && git rev-parse --show-toplevel 2>/dev/null)"; then
+    SUBPATH="${MOUNT_DIR#"$root"}"   # e.g. "" or "/sub/dir"
+    MOUNT_DIR="$root"
+  fi
+fi
+GUEST_WORKDIR="/workspace${SUBPATH}"
+
+# sign-on-exit targets the mounted repo by default; --worktree repoints it below.
+HOST_GIT_WORKTREE="$MOUNT_DIR"
+WT_HOST=""
+
+# Pre-scan args for --worktree so the resolution below (and the VM name) can
+# account for it -- this runs before main() does the authoritative parse. Stop
+# at `--` so a --worktree meant for `claude` isn't mistaken for ours.
+_prev=""
+for _a in "$@"; do
+  [ "$_a" = "--" ] && break
+  case "$_prev" in --worktree) WORKTREE_NAME="$_a" ;; esac
+  case "$_a" in --worktree=*) WORKTREE_NAME="${_a#*=}" ;; esac
+  _prev="$_a"
+done
+unset _prev _a
+
+# --- resolve --worktree ----------------------------------------------------
+# The worktree lives at <repo-root>/<subdir>/<name>, which is under the mounted
+# /workspace, so the same VM sees it with no remount. MOUNT_DIR (and thus the VM
+# name) stays the repo root -> same VM for every worktree of a repo.
+if [ -n "$WORKTREE_NAME" ]; then
+  command -v git >/dev/null 2>&1 || {
+    echo "vm-claude: --worktree needs git on the host." >&2; exit 1
+  }
+  if ! WT_ROOT="$(cd "$MOUNT_DIR" && git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "vm-claude: --worktree needs to be run inside a git repo (${MOUNT_DIR} isn't one)." >&2
+    exit 1
+  fi
+  MOUNT_DIR="$WT_ROOT"
+  case "$WORKTREE_NAME" in
+    */*|.|..) echo "vm-claude: --worktree name must be a single path segment." >&2; exit 1 ;;
+  esac
+  WT_HOST="${MOUNT_DIR}/${WORKTREE_SUBDIR}/${WORKTREE_NAME}"
+  GUEST_WORKDIR="/workspace/${WORKTREE_SUBDIR}/${WORKTREE_NAME}"
+  HOST_GIT_WORKTREE="$WT_HOST"
+fi
+
+# --- stable per-project VM name --------------------------------------------
+# Hash the absolute path so each project gets its own persistent VM.
+hash="$(printf '%s' "$MOUNT_DIR" | cksum | cut -d' ' -f1)"
+NAME="vm-claude-$(basename "$MOUNT_DIR")-${hash}"
+
+# Per-VM host dirs for the clipboard bridge: `shared` is mounted into the guest,
+# `work` is host-only staging on the SAME filesystem, so renames of served files
+# into `shared` are atomic and can't be redirected by a guest-planted symlink.
+CLIP_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/vm-claude/clip/${NAME}"
+CLIP_SHARED="${CLIP_ROOT}/shared"
+CLIP_WORK="${CLIP_ROOT}/work"
+
+# --- host timezone ---------------------------------------------------------
+# The guest is UTC otherwise, which shows up as a +0000 offset on every commit
+# made inside the VM while host commits carry the real local offset.
+host_timezone() {
+  local tz="${CLAUDE_VM_TZ:-${TZ:-}}"
+
+  if [ -z "$tz" ] && [ -r /etc/timezone ]; then
+    tz="$(cat /etc/timezone 2>/dev/null)"
+  fi
+  # macOS and most Linux: /etc/localtime -> .../zoneinfo/Europe/Lisbon
+  if [ -z "$tz" ] && [ -L /etc/localtime ]; then
+    local target
+    target="$(readlink /etc/localtime)"
+    tz="${target##*zoneinfo/}"
+  fi
+
+  # Only accept a plausible Area/City name. This gets inlined into a command
+  # run in the guest, so anything unexpected is dropped rather than escaped.
+  case "$tz" in
+    ''|/*|*[!A-Za-z0-9_/+-]*) tz="" ;;
+  esac
+  printf '%s' "$tz"
+}
+
+TZ_NAME="$(host_timezone)"
+
+# Shell fragment (ending in `&&`) that pins the guest clock, or nothing.
+tz_setup_cmd() {
+  [ -n "$TZ_NAME" ] || return 0
+  printf 'ln -sf /usr/share/zoneinfo/%s /etc/localtime && printf %s > /etc/timezone && export TZ=%s &&\n' \
+    "$TZ_NAME" "$TZ_NAME" "$TZ_NAME"
+}
+
+# --- ensure msb CLI is present ---------------------------------------------
+ensure_msb() {
+  if command -v msb >/dev/null 2>&1; then
+    return
+  fi
+  echo "msb (microsandbox) not found -> installing..." >&2
+  case "$(uname -s)" in
+    Linux|Darwin)
+      curl -fsSL https://install.microsandbox.dev | sh
+      ;;
+    *)
+      echo "Unsupported OS. Install msb manually: https://docs.microsandbox.dev" >&2
+      exit 1
+      ;;
+  esac
+  # install script drops msb in ~/.local/bin typically
+  if ! command -v msb >/dev/null 2>&1; then
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+  command -v msb >/dev/null 2>&1 || {
+    echo "msb still not on PATH. Add its install dir to PATH and re-run." >&2
+    exit 1
+  }
+}
+
+# --- ensure pngpaste is present (for image paste) ---------------------------
+# Like ensure_msb, but non-fatal: pngpaste only powers image paste, so if it
+# can't be installed we warn and let the session run (text paste still works).
+# macOS + Homebrew only -- pngpaste has no portable installer.
+ensure_pngpaste() {
+  command -v pngpaste >/dev/null 2>&1 && return 0
+  if command -v brew >/dev/null 2>&1; then
+    echo "clipboard: pngpaste not found -> installing via Homebrew..." >&2
+    brew install pngpaste >/dev/null 2>&1 \
+      || echo "clipboard: 'brew install pngpaste' failed; image paste disabled (text paste still works)." >&2
+  else
+    echo "clipboard: pngpaste not found and Homebrew is not installed; image paste disabled (text paste still works)." >&2
+    echo "  install Homebrew (https://brew.sh) then 'brew install pngpaste' to enable image paste." >&2
+  fi
+}
+
+# --- does the VM already exist? --------------------------------------------
+vm_exists() {
+  msb list 2>/dev/null | grep -q "\b${NAME}\b"
+}
+
+# Emit `git config --global` commands for the SAFE subset of the host config.
+# Explicitly excludes anything that could carry secrets: credential.*, *.token,
+# user.signingkey, gpg.*, http.*, url.*.insteadOf, sendemail.*, etc.
+host_git_config() {
+  command -v git >/dev/null 2>&1 || return 0
+
+  # exact keys to copy verbatim if present on the host
+  local keys="user.name user.email init.defaultBranch pull.rebase \
+    push.default push.autoSetupRemote rebase.autostash fetch.prune \
+    merge.conflictstyle diff.colorMoved color.ui"
+
+  local k v esc
+  for k in $keys; do
+    v="$(git config --global --get "$k" 2>/dev/null)" || continue
+    [ -n "$v" ] || continue
+    esc="$(printf "%s" "$v" | sed "s/'/'\\\\''/g")"
+    printf "git config --global '%s' '%s' && " "$k" "$esc"
+  done
+
+  # all aliases (alias.<name> = <value>); values may contain spaces
+  git config --global --get-regexp '^alias\.' 2>/dev/null | while IFS= read -r line; do
+    k="${line%% *}"; v="${line#* }"
+    esc="$(printf "%s" "$v" | sed "s/'/'\\\\''/g")"
+    printf "git config --global '%s' '%s' && " "$k" "$esc"
+  done
+}
+
+# --- host ~/.claude config -------------------------------------------------
+# The guest keeps its own ~/.claude (that's where its auth and sessions live),
+# so out of the box it has none of the user's actual configuration: no global
+# CLAUDE.md, no settings, no custom agents/commands/skills.
+#
+# Ship those across as a gzipped tar, base64'd and inlined into the command we
+# already run in the guest. Deliberately NOT a second --mount-dir: a mount of
+# ~/.claude would put .credentials.json and every other project's transcripts
+# inside the box for the life of the VM, which is exactly what this tool exists
+# to avoid. Only the allowlisted entries ever leave the host.
+#
+# Prints the base64 payload on stdout, or nothing if there is nothing to send.
+build_config_payload() {
+  [ "$CONFIG_SYNC" != "0" ] || return 0
+  [ -d "$CONFIG_SRC" ] || return 0
+  command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 || {
+    echo "warning: tar/base64 not found on the host, skipping ~/.claude config." >&2
+    return 0
+  }
+
+  # CONFIG_ITEMS is intentionally split on whitespace; entries can't contain it.
+  local present=() item
+  for item in $CONFIG_ITEMS; do
+    [ -e "${CONFIG_SRC}/${item}" ] && present+=("$item")
+  done
+  [ ${#present[@]} -gt 0 ] || return 0
+
+  # macOS `tar` is bsdtar and stamps Apple xattrs (com.apple.provenance, ...)
+  # into the archive; GNU tar in the guest can't read them and warns once per
+  # file. Strip that metadata at the source so the payload is plain portable tar.
+  local tar_flags=()
+  case "$(uname -s)" in
+    Darwin) tar_flags=(--no-mac-metadata --no-xattrs) ;;
+  esac
+
+  local b64 kb
+  # `base64` wraps by default on some platforms and not others; unwrap always.
+  b64="$(tar ${tar_flags[@]+"${tar_flags[@]}"} -czf - -C "$CONFIG_SRC" "${present[@]}" 2>/dev/null | base64 | tr -d '\n')" || return 0
+  [ -n "$b64" ] || return 0
+
+  # The payload rides in an argv entry, and Linux caps a single argument at
+  # 128 KiB. Refuse rather than get killed with a confusing E2BIG.
+  kb=$(( ${#b64} / 1024 ))
+  if [ "$kb" -gt "$CONFIG_MAX_KB" ]; then
+    echo "warning: ~/.claude subset is ${kb}KB (limit ${CONFIG_MAX_KB}KB), not copying into the guest." >&2
+    echo "  trim it with CLAUDE_VM_CONFIG_ITEMS, or raise CLAUDE_VM_CONFIG_MAX_KB." >&2
+    return 0
+  fi
+
+  printf '%s' "$b64"
+}
+
+# Shell fragment (ending in `&&`) that unpacks the payload from $claude_config
+# into the guest's ~/.claude, or nothing when there is no payload. Only the
+# allowlisted paths are overwritten; the VM's credentials and sessions survive.
+config_restore_cmd() {
+  [ -n "$CONFIG_B64" ] || return 0
+  printf '%s\n' \
+    'mkdir -p "$HOME/.claude" &&' \
+    'printf %s "$claude_config" | base64 -d | tar --warning=no-unknown-keyword -xzf - -C "$HOME/.claude" &&'
+}
+
+# Shell fragment (ending in `&&`) that deletes the CONFIG_STRIP keys from the
+# shipped settings.json and clears the macOS AppleDouble (._*) files the host tar
+# seeds. The JSON edit is done with node, which the node base image always
+# provides, so no jq/python is needed on the host. The key list rides in as an
+# env var; the node program itself is generic (delete whatever keys it's told).
+config_sanitize_cmd() {
+  [ -n "$CONFIG_B64" ] || return 0
+  local js b64 esc
+  if [ -n "$CONFIG_STRIP" ]; then
+    js='const fs=require("fs"),f=process.env.SETTINGS;try{const s=JSON.parse(fs.readFileSync(f,"utf8"));for(const k of (process.env.STRIP||"").split(/\s+/).filter(Boolean))delete s[k];fs.writeFileSync(f,JSON.stringify(s,null,2))}catch(e){}'
+    b64="$(printf '%s' "$js" | base64 | tr -d '\n')"
+    esc="$(printf '%s' "$CONFIG_STRIP" | sed "s/'/'\\\\''/g")"
+    printf '%s\n' \
+      "[ -f \"\$HOME/.claude/settings.json\" ] && printf %s '${b64}' | base64 -d | STRIP='${esc}' SETTINGS=\"\$HOME/.claude/settings.json\" node - || true &&"
+  fi
+  printf '%s\n' \
+    "find \"\$HOME/.claude\" -name '._*' -type f -delete 2>/dev/null || true &&"
+}
+
+# --- sign the VM's commits, on the host ------------------------------------
+# /workspace IS the host repo (we mount the git root), so commits made in the
+# guest are already real objects in the host's .git — they just carry no
+# signature, because no signing key is ever copied in. Re-create them out here,
+# where the key lives. --force-rebase is required: a plain rebase onto an
+# ancestor fast-forwards, re-creates nothing, and so signs nothing.
+host_head() {
+  git -C "$HOST_GIT_WORKTREE" rev-parse HEAD 2>/dev/null || true
+}
+
+sign_new_commits() {
+  local before="$1" after branch n
+  after="$(host_head)"
+
+  if [ -z "$before" ] || [ -z "$after" ]; then
+    echo "sign-on-exit: could not read HEAD in ${HOST_GIT_WORKTREE}, skipping." >&2
+    return 0
+  fi
+  if [ "$before" = "$after" ]; then
+    echo "sign-on-exit: no new commits." >&2
+    return 0
+  fi
+
+  branch="$(git -C "$HOST_GIT_WORKTREE" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if [ -z "$branch" ]; then
+    echo "sign-on-exit: HEAD is detached, skipping." >&2
+    echo "  sign manually: git -C '${HOST_GIT_WORKTREE}' rebase -f -S ${before}" >&2
+    return 0
+  fi
+
+  # If claude rebased or reset rather than just committing, $before is no
+  # longer an ancestor and rewriting from it would discard work. Bail instead.
+  if ! git -C "$HOST_GIT_WORKTREE" merge-base --is-ancestor "$before" "$after" 2>/dev/null; then
+    echo "sign-on-exit: history diverged from ${before}, skipping to avoid rewriting it." >&2
+    return 0
+  fi
+
+  n="$(git -C "$HOST_GIT_WORKTREE" rev-list --count "${before}..${after}" 2>/dev/null || echo 0)"
+  echo "sign-on-exit: signing ${n} new commit(s) on ${branch}..." >&2
+
+  if git -C "$HOST_GIT_WORKTREE" rebase --force-rebase --gpg-sign --autostash "$before" >/dev/null 2>&1; then
+    echo "sign-on-exit: done, ${branch} is now $(git -C "$HOST_GIT_WORKTREE" rev-parse --short HEAD)." >&2
+  else
+    git -C "$HOST_GIT_WORKTREE" rebase --abort >/dev/null 2>&1 || true
+    echo "sign-on-exit: rebase failed, nothing rewritten." >&2
+    echo "  retry manually: git -C '${HOST_GIT_WORKTREE}' rebase -f -S ${before}" >&2
+  fi
+}
+
+# A single exit path shared by --sign-on-exit and the clipboard watcher: the
+# EXIT trap does the work; the signal traps just turn a signal into an exit so it
+# runs exactly once whichever way we go down (clean /q, Ctrl-C, closed terminal).
+TRAPS_SET=0
+on_exit() {
+  if [ "$SIGN_ON_EXIT" = "1" ] && [ -n "$HEAD_BEFORE" ]; then
+    sign_new_commits "$HEAD_BEFORE"
+  fi
+  [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null || true
+}
+ensure_traps() {
+  [ "$TRAPS_SET" = "1" ] && return 0
+  TRAPS_SET=1
+  trap on_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
+}
+
+# Arm the exit hook: note HEAD now, sign whatever the VM adds on the way out.
+# Announced out loud, because a silent arm is indistinguishable from a flag
+# that was never passed -- which is exactly how this looks when it misfires.
+arm_sign_on_exit() {
+  [ "$SIGN_ON_EXIT" = "1" ] || return 0
+
+  HEAD_BEFORE="$(host_head)"
+  if [ -z "$HEAD_BEFORE" ]; then
+    echo "sign-on-exit: no HEAD in ${HOST_GIT_WORKTREE} to compare against, not arming." >&2
+    return 0
+  fi
+  if [ -z "$(git -C "$HOST_GIT_WORKTREE" config --get user.signingkey 2>/dev/null)" ]; then
+    echo "warning: --sign-on-exit given but user.signingkey is unset on the host." >&2
+  fi
+
+  echo "sign-on-exit: armed at $(git -C "$HOST_GIT_WORKTREE" rev-parse --short HEAD)." >&2
+  # Sign on a clean /q, and also when the session is interrupted or its terminal
+  # is closed -- Ctrl-C, SIGTERM, SIGHUP. The signal traps only exit; the EXIT
+  # trap does the signing, so it runs exactly once whichever way we go down.
+  ensure_traps
+}
+
+# --- clipboard bridge wiring -----------------------------------------------
+# Shell fragment (ends in `&&`) that installs the guest shim and turns on
+# Claude's Linux clipboard path -- it only probes the clipboard when DISPLAY or
+# WAYLAND_DISPLAY is set, so we set DISPLAY. Empty unless --clip is on.
+clip_guest_setup_cmd() {
+  [ "$CLIP_ENABLE" = "1" ] || return 0
+  local b64
+  b64="$(printf '%s' "$CLIP_SHIM_SRC" | base64 | tr -d '\n')"
+  printf '%s\n' \
+    "printf %s '${b64}' | base64 -d > /usr/local/bin/xclip && chmod 0755 /usr/local/bin/xclip &&" \
+    "export DISPLAY=:0 && export VM_CLIP_DIR=/run/vm-clip &&"
+}
+
+# Non-fatal guest check (ends in `;`) that warns if the bridge isn't actually
+# wired up -- e.g. --clip on a VM first booted without it, so the mount is
+# absent. The shim already fails fast in that case; this just explains why.
+clip_ready_check_cmd() {
+  [ "$CLIP_ENABLE" = "1" ] || return 0
+  printf '%s\n' \
+    '{ [ -e /run/vm-clip/ready ] || { sleep 0.5; [ -e /run/vm-clip/ready ]; } || echo "vm-claude: clipboard bridge not active for this VM; recreate with --rm to enable." >&2; } ;'
+}
+
+# Launch the host-side watcher and arm its teardown. macOS only (guarded by the
+# caller). Creates the shared dir the boot-time mount points at, so it must run
+# before start_fresh.
+start_watcher() {
+  [ "$CLIP_ENABLE" = "1" ] || return 0
+  ensure_pngpaste
+  mkdir -p "$CLIP_SHARED" "$CLIP_WORK"
+  local w="${CLIP_ROOT}/watcher.sh"
+  printf '%s\n' "$CLIP_WATCHER_SRC" > "$w"
+  sh "$w" "$CLIP_SHARED" "$CLIP_WORK" "$NAME" &
+  WATCHER_PID=$!
+  printf '%s\n' "$WATCHER_PID" > "${CLIP_ROOT}/watcher.pid" 2>/dev/null || true
+  ensure_traps
+  echo "clipboard: bridge armed -- you'll approve each paste in a host dialog." >&2
+}
+
+# True if $1 is a live process whose command line is this VM's watcher. Reads
+# /proc where it exists (Linux) and falls back to ps (macOS) -- so the identity
+# check works on both without assuming either is present.
+pid_is_our_watcher() {
+  local pid="$1" cmd=""
+  [ -n "$pid" ] || return 1
+  if [ -r "/proc/$pid/cmdline" ]; then
+    cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)"
+  else
+    cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  fi
+  printf '%s' "$cmd" | grep -qF "${CLIP_ROOT}/watcher.sh"
+}
+
+# Kill any clipboard watcher still running for THIS VM (e.g. one a hard kill
+# orphaned, whose EXIT trap never fired). Uses the pid recorded at launch, and
+# only kills it after confirming that pid is still *our* watcher -- so a stale
+# pidfile whose pid was recycled by an unrelated process is left untouched.
+stop_stray_watcher() {
+  local pidfile="${CLIP_ROOT}/watcher.pid" pid
+  [ -f "$pidfile" ] || return 0
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  pid_is_our_watcher "$pid" && kill "$pid" 2>/dev/null || true
+  rm -f "$pidfile" 2>/dev/null || true
+}
+
+# Wipe this VM's host-side clipboard state: stray watcher + the whole cache dir.
+clip_wipe() {
+  stop_stray_watcher
+  rm -rf "$CLIP_ROOT" 2>/dev/null || true
+}
+
+# --- --worktree: create/attach the worktree on the host -------------------
+# Runs on the host before the VM starts. The worktree lives under the repo root
+# so it's already inside the /workspace mount -> the same VM sees it live, no
+# remount needed even on an already-running VM. Created with --relative-paths so
+# the .git pointer files resolve identically on the host and under /workspace in
+# the guest (whose git is too old to WRITE relative links but reads them fine).
+# On first creation only, gitignored + untracked files (.env, secrets, ...) are
+# copied in from the main working tree, since `git worktree add` checks out only
+# tracked files.
+ensure_worktree() {
+  [ -n "$WORKTREE_NAME" ] || return 0
+
+  # Already there -> attach, nothing to do (the copy is create-only).
+  [ -e "$WT_HOST/.git" ] && return 0
+
+  echo "worktree: creating '${WORKTREE_NAME}' at ${WT_HOST}..." >&2
+  mkdir -p "${MOUNT_DIR}/${WORKTREE_SUBDIR}"
+
+  # Keep the worktree holder out of the main repo's status. info/exclude is local
+  # (uncommitted), unlike .gitignore -- append the line once, idempotently.
+  local excl="${MOUNT_DIR}/.git/info/exclude"
+  if [ -f "$excl" ] && ! grep -qxF "/${WORKTREE_SUBDIR}/" "$excl"; then
+    printf '/%s/\n' "$WORKTREE_SUBDIR" >> "$excl"
+  fi
+
+  # Relative pointer files (git >= 2.48) so the links survive the host->guest
+  # path remap. Older git: fall back to a plain add and relativize by hand below.
+  local relflag="" rel_fallback=0
+  if git worktree add -h 2>&1 | grep -q 'relative-paths'; then
+    relflag="--relative-paths"
+  else
+    rel_fallback=1
+    echo "worktree: host git lacks --relative-paths; relativizing links by hand." >&2
+  fi
+
+  if git -C "$MOUNT_DIR" show-ref --verify --quiet "refs/heads/${WORKTREE_NAME}"; then
+    git -C "$MOUNT_DIR" worktree add $relflag "$WT_HOST" "$WORKTREE_NAME"
+  else
+    git -C "$MOUNT_DIR" worktree add $relflag -b "$WORKTREE_NAME" "$WT_HOST"
+  fi
+
+  # Fallback relativization: rewrite the forward gitfile and the back-pointer to
+  # paths relative to the repo root, so they hold under /workspace too. Depth is
+  # fixed by WORKTREE_SUBDIR/WORKTREE_NAME (two levels below the root).
+  if [ "$rel_fallback" = 1 ]; then
+    local gitdir="${MOUNT_DIR}/.git/worktrees/${WORKTREE_NAME}"
+    printf 'gitdir: ../../.git/worktrees/%s\n' "$WORKTREE_NAME" > "$WT_HOST/.git"
+    [ -f "$gitdir/gitdir" ] && \
+      printf '../../../%s/%s/.git\n' "$WORKTREE_SUBDIR" "$WORKTREE_NAME" > "$gitdir/gitdir"
+  fi
+
+  # Copy untracked + gitignored files from the main working tree into the fresh
+  # worktree (create-only). Reuse tar (already a hard dep) with a NUL-safe file
+  # list; `.git` is never listed by `ls-files --others`, and tracked files the
+  # worktree already checked out are left untouched. The ignored pass lists the
+  # worktree holder ($WORKTREE_SUBDIR) as a collapsed nested-repo entry that
+  # pathspec exclusion won't drop, so it gets copied in -- then removed right
+  # after, so the worktree never ends up nested inside itself.
+  if command -v tar >/dev/null 2>&1; then
+    { git -C "$MOUNT_DIR" ls-files -z --others --exclude-standard
+      git -C "$MOUNT_DIR" ls-files -z --others --ignored --exclude-standard; } \
+      | tar -C "$MOUNT_DIR" --null -T - -cf - 2>/dev/null \
+      | tar -C "$WT_HOST" -xf - 2>/dev/null \
+      && echo "worktree: copied gitignored/untracked files into ${WORKTREE_NAME}." >&2 \
+      || echo "worktree: nothing extra to copy (or copy skipped)." >&2
+    rm -rf "${WT_HOST:?}/${WORKTREE_SUBDIR}" 2>/dev/null || true
+  fi
+}
+
+# Shell fragment (ending in `&&`) marking the worktree path as a safe git dir in
+# the guest. `safe.directory /workspace` doesn't cover a linked worktree's own
+# top-level, so without this git in the guest refuses it as dubiously-owned.
+worktree_safe_dir_cmd() {
+  [ -n "$WORKTREE_NAME" ] || return 0
+  printf "git config --global --add safe.directory '%s' &&\n" "$GUEST_WORKDIR"
+}
+
+# $1 is the (possibly empty) config payload; the rest is claude's own argv.
+boot_cmd() {
+  cat <<EOF
+claude_config="\$1" && shift &&
+apt-get update &&
+apt-get install -y --no-install-recommends ca-certificates git tzdata &&
+$(tz_setup_cmd)
+git config --global --add safe.directory /workspace &&
+$(worktree_safe_dir_cmd)
+$(host_git_config)
+npm install -g @anthropic-ai/claude-code@${VERSION} &&
+$(config_restore_cmd)
+$(config_sanitize_cmd)
+$(clip_guest_setup_cmd)
+$(clip_ready_check_cmd)
+export IS_SANDBOX=1 &&
+exec claude "\$@"
+EOF
+}
+
+start_fresh() {
+  echo "Booting new microVM '${NAME}' (image ${IMAGE}, ${CPUS} cpu / ${MEMORY} ram)..." >&2
+  local clip_mount=()
+  if [ "$CLIP_ENABLE" = "1" ]; then
+    clip_mount=(--mount-dir "${CLIP_SHARED}:/run/vm-clip:rw")
+  fi
+  msb run -t --name "$NAME" --replace \
+    --cpus "$CPUS" --memory "$MEMORY" --root-disk "$DISK" \
+    --mount-dir "${MOUNT_DIR}:/workspace:rw" \
+    ${clip_mount[@]+"${clip_mount[@]}"} \
+    --workdir "$GUEST_WORKDIR" \
+    "$IMAGE" -- sh -lc "$(boot_cmd)" _ "$CONFIG_B64" "$@"
+}
+
+# TZ and the config payload are passed as positional args rather than spliced
+# into the script text. The config is re-applied on every resume, so edits to
+# the host's ~/.claude show up next run (and overwrite the guest's copy).
+resume() {
+  echo "Resuming microVM '${NAME}'..." >&2
+  local script
+  script=$(cat <<EOF
+cd "\$1" || exit 1; shift
+[ -n "\$1" ] && export TZ="\$1"; shift
+if [ -n "\$1" ]; then
+  mkdir -p "\$HOME/.claude" &&
+  printf %s "\$1" | base64 -d | tar --warning=no-unknown-keyword -xzf - -C "\$HOME/.claude" &&
+  $(config_sanitize_cmd)
+  true
+fi
+shift
+$(worktree_safe_dir_cmd) true
+echo "Updating claude (@${VERSION})..." >&2
+npm install -g @anthropic-ai/claude-code@${VERSION} --no-fund --no-audit --loglevel=error \
+  || echo "vm-claude: claude update failed; using the version already installed." >&2
+$(clip_guest_setup_cmd)
+$(clip_ready_check_cmd)
+export IS_SANDBOX=1
+exec claude "\$@"
+EOF
+)
+  msb exec -t "$NAME" -- sh -lc "$script" _ "$GUEST_WORKDIR" "$TZ_NAME" "$CONFIG_B64" "$@"
+}
+
+main() {
+  local mode="run"
+  local passthru=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --shell) mode="shell"; shift ;;
+      --stop)  mode="stop";  shift ;;
+      --rm)    mode="rm";    shift ;;
+      --sign-on-exit)    SIGN_ON_EXIT=1; shift ;;
+      --no-sign-on-exit) SIGN_ON_EXIT=0; shift ;;
+      --clip)    CLIP_ENABLE=1; CLIP_EXPLICIT=1; shift ;;
+      --no-clip) CLIP_ENABLE=0; CLIP_EXPLICIT=1; shift ;;
+      --worktree) WORKTREE_NAME="${2:?--worktree needs a name}"; shift 2 ;;
+      --worktree=*) WORKTREE_NAME="${1#*=}"; shift ;;
+      --)      shift; passthru+=("$@"); break ;;
+      *)       passthru+=("$1"); shift ;;
+    esac
+  done
+
+  ensure_msb
+
+  # The clipboard watcher reads the macOS pasteboard (pngpaste/pbpaste/osascript);
+  # there's no portable equivalent to bridge here, so it's macOS-host only. It's
+  # on by default, so stay quiet when disabling on a non-macOS host unless the
+  # user asked for it explicitly.
+  if [ "$CLIP_ENABLE" = "1" ] && [ "$(uname -s)" != "Darwin" ]; then
+    [ "$CLIP_EXPLICIT" = "1" ] && echo "clipboard: --clip needs a macOS host; disabling for this run." >&2
+    CLIP_ENABLE=0
+  fi
+
+  case "$mode" in
+    stop)
+      stop_stray_watcher
+      msb stop "$NAME" && echo "Stopped ${NAME}." ;;
+    rm)
+      msb stop "$NAME" 2>/dev/null || true
+      msb remove "$NAME" 2>/dev/null || msb rm "$NAME"
+      clip_wipe
+      echo "Removed ${NAME} (state wiped)." ;;
+    shell)
+      ensure_worktree
+      arm_sign_on_exit
+      start_watcher
+      local clip_mount=()
+      if [ "$CLIP_ENABLE" = "1" ]; then
+        clip_mount=(--mount-dir "${CLIP_SHARED}:/run/vm-clip:rw")
+      fi
+      if vm_exists; then
+        msb exec -t "$NAME" -- sh -lc "$(clip_guest_setup_cmd)export IS_SANDBOX=1; exec sh -l"
+      else
+        msb run -t --name "$NAME" --replace \
+          --cpus "$CPUS" --memory "$MEMORY" --root-disk "$DISK" \
+          --mount-dir "${MOUNT_DIR}:/workspace:rw" \
+          ${clip_mount[@]+"${clip_mount[@]}"} \
+          --workdir "$GUEST_WORKDIR" \
+          "$IMAGE" -- sh -lc "$(clip_guest_setup_cmd)export IS_SANDBOX=1; exec sh -l"
+      fi ;;
+    run)
+      # The microVM is already the sandbox: only the project dir is visible and
+      # everything else in the guest is throwaway. So run claude unattended by
+      # default; IS_SANDBOX=1 in the guest is what lets the flag work as root.
+      CONFIG_B64="$(build_config_payload)"
+      if [ "$SKIP_PERMISSIONS" != "0" ]; then
+        passthru=(--dangerously-skip-permissions ${passthru[@]+"${passthru[@]}"})
+      fi
+      ensure_worktree
+      arm_sign_on_exit
+      start_watcher
+      if vm_exists; then
+        resume ${passthru[@]+"${passthru[@]}"}
+      else
+        start_fresh ${passthru[@]+"${passthru[@]}"}
+      fi ;;
+  esac
+}
+
+main "$@"
