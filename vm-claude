@@ -17,6 +17,12 @@
 #   vm-claude --no-clip       # disable the clipboard bridge (on by default)
 #   vm-claude --worktree NAME # run in a git worktree (created if missing) in the
 #                             # same VM; gitignored files are copied in on create
+#   vm-claude --cpus 4 --memory 8G --disk 16G
+#                             # sizes for this run; on a new VM they're applied
+#                             # at boot, on an existing one only with --resize
+#   vm-claude --resize        # push those sizes onto the EXISTING VM: cpu/ram
+#                             # change live; a disk size or a new --max-* ceiling
+#                             # reboots it (keeping its disk/auth/session state)
 #   vm-claude -- <args...>    # pass args straight to `claude`
 #
 # claude runs with --dangerously-skip-permissions by default: the microVM is
@@ -30,6 +36,13 @@
 #   CLAUDE_VM_CPUS      vCPUs                     (default 2)
 #   CLAUDE_VM_MEMORY    RAM                       (default 4G)
 #   CLAUDE_VM_DISK      root disk                 (default 4G)
+#   CLAUDE_VM_MAX_CPUS      live-resize ceiling for vCPUs  (default: CPUS)
+#   CLAUDE_VM_MAX_MEMORY    live-resize ceiling for RAM    (default: MEMORY)
+#                       These are fixed when the VM boots and default to the
+#                       starting size, i.e. no room to grow. Set them above
+#                       CPUS/MEMORY to leave headroom that a later `--resize`
+#                       can claim live. Raising them on an existing VM works
+#                       too (`--resize`), at the cost of one reboot.
 #   CLAUDE_VM_MOUNT     host dir to mount as /workspace (default: $PWD)
 #   CLAUDE_VM_SKIP_PERMISSIONS  1 (default) passes --dangerously-skip-permissions
 #   CLAUDE_VM_SIGN_ON_EXIT      1/0 forces --sign-on-exit on/off (default: on
@@ -58,6 +71,19 @@ IMAGE="${CLAUDE_VM_IMAGE:-public.ecr.aws/docker/library/node:24-bookworm-slim}"
 CPUS="${CLAUDE_VM_CPUS:-2}"
 MEMORY="${CLAUDE_VM_MEMORY:-4G}"
 DISK="${CLAUDE_VM_DISK:-4G}"
+# Resize ceilings. msb grows a RUNNING VM's cpu/ram (msb modify) only up to the
+# max_cpus/max_memory it booted with, and those default to the starting size --
+# so headroom has to be asked for up front. Left empty here and defaulted to
+# CPUS/MEMORY in resolve_limits(), after the CLI parse has had its say.
+MAX_CPUS="${CLAUDE_VM_MAX_CPUS:-}"
+MAX_MEMORY="${CLAUDE_VM_MAX_MEMORY:-}"
+MAX_FLAGS=()
+CEILING_SET=0
+# Only pass --root-disk to a resize when a size was actually asked for: the disk
+# arm of `msb modify` reboots the VM, and nobody wants that on every --resize.
+DISK_EXPLICIT=0
+if [ -n "${CLAUDE_VM_DISK:-}" ]; then DISK_EXPLICIT=1; fi
+RESIZE=0
 MOUNT_DIR="${CLAUDE_VM_MOUNT:-$PWD}"
 SKIP_PERMISSIONS="${CLAUDE_VM_SKIP_PERMISSIONS:-1}"
 HEAD_BEFORE=""
@@ -384,6 +410,62 @@ ensure_pngpaste() {
 # --- does the VM already exist? --------------------------------------------
 vm_exists() {
   msb list 2>/dev/null | grep -q "\b${NAME}\b"
+}
+
+# --- resource ceilings ------------------------------------------------------
+# Runs after the CLI parse so --cpus/--memory feed the defaults. The --max-*
+# flags are emitted ONLY when headroom was actually requested, so an msb too old
+# to know them keeps working for everyone who never asked.
+resolve_limits() {
+  : "${MAX_CPUS:=$CPUS}"
+  : "${MAX_MEMORY:=$MEMORY}"
+  MAX_FLAGS=()
+  if [ "$MAX_CPUS" != "$CPUS" ]; then
+    MAX_FLAGS+=(--max-cpus "$MAX_CPUS"); CEILING_SET=1
+  fi
+  if [ "$MAX_MEMORY" != "$MEMORY" ]; then
+    MAX_FLAGS+=(--max-memory "$MAX_MEMORY"); CEILING_SET=1
+  fi
+}
+
+# --- push new sizes onto an existing VM (--resize) --------------------------
+# Three boundaries, which is why this builds the flag list rather than always
+# sending everything:
+#   * cpu/ram apply LIVE, but only up to the ceiling the VM booted with.
+#   * the ceilings themselves, and the root disk, are fixed at boot -- changing
+#     either needs a reboot, so those arms add --restart.
+#   * the root disk only ever grows.
+# A reboot here is not a --rm: the disk contents, auth and session history
+# included, survive it. So a VM created before ceilings existed can still be
+# given headroom -- `--resize --max-cpus N --max-memory X` costs one restart.
+# Best-effort by design -- a refused resize (no headroom, a shrink, an msb
+# without `modify`) is reported and the session continues at the current size.
+apply_resize() {
+  local flags=(--cpus "$CPUS" --memory "$MEMORY")
+  local what="${CPUS} cpu / ${MEMORY} ram"
+  local reboot=0
+  if [ "$DISK_EXPLICIT" = "1" ]; then
+    flags+=(--root-disk "$DISK")
+    what="${what} / ${DISK} disk"
+    reboot=1
+  fi
+  if [ "$CEILING_SET" = "1" ]; then
+    flags+=("${MAX_FLAGS[@]}")
+    what="${what}, ceiling ${MAX_CPUS} cpu / ${MAX_MEMORY}"
+    reboot=1
+  fi
+  if [ "$reboot" = "1" ]; then
+    flags+=(--restart)
+    what="${what} (reboots the VM)"
+  fi
+  echo "Resizing '${NAME}' -> ${what}..." >&2
+  if ! msb modify "$NAME" "${flags[@]}"; then
+    echo "vm-claude: resize refused; continuing at the VM's current size." >&2
+    echo "  cpu/ram grow only up to the ceiling the VM booted with ('msb ps'" >&2
+    echo "  shows effective / max); the root disk only grows. To raise the" >&2
+    echo "  ceiling, re-run with --resize --max-cpus N --max-memory X, which" >&2
+    echo "  reboots the VM but keeps its disk, auth and session history." >&2
+  fi
 }
 
 # Emit `git config --global` commands for the SAFE subset of the host config.
@@ -752,13 +834,18 @@ EOF
 }
 
 start_fresh() {
-  echo "Booting new microVM '${NAME}' (image ${IMAGE}, ${CPUS} cpu / ${MEMORY} ram)..." >&2
+  local ceiling=""
+  if [ "$CEILING_SET" = "1" ]; then
+    ceiling=", up to ${MAX_CPUS} cpu / ${MAX_MEMORY}"
+  fi
+  echo "Booting new microVM '${NAME}' (image ${IMAGE}, ${CPUS} cpu / ${MEMORY} ram / ${DISK} disk${ceiling})..." >&2
   local clip_mount=()
   if [ "$CLIP_ENABLE" = "1" ]; then
     clip_mount=(--mount-dir "${CLIP_SHARED}:/run/vm-clip:rw")
   fi
   msb run -t --name "$NAME" --replace \
     --cpus "$CPUS" --memory "$MEMORY" --root-disk "$DISK" \
+    ${MAX_FLAGS[@]+"${MAX_FLAGS[@]}"} \
     --mount-dir "${MOUNT_DIR}:/workspace:rw" \
     ${clip_mount[@]+"${clip_mount[@]}"} \
     --workdir "$GUEST_WORKDIR" \
@@ -809,11 +896,23 @@ main() {
       --no-clip) CLIP_ENABLE=0; CLIP_EXPLICIT=1; shift ;;
       --worktree) WORKTREE_NAME="${2:?--worktree needs a name}"; shift 2 ;;
       --worktree=*) WORKTREE_NAME="${1#*=}"; shift ;;
+      --cpus)   CPUS="${2:?--cpus needs a value}"; shift 2 ;;
+      --cpus=*) CPUS="${1#*=}"; shift ;;
+      --memory)   MEMORY="${2:?--memory needs a value}"; shift 2 ;;
+      --memory=*) MEMORY="${1#*=}"; shift ;;
+      --disk)   DISK="${2:?--disk needs a value}"; DISK_EXPLICIT=1; shift 2 ;;
+      --disk=*) DISK="${1#*=}"; DISK_EXPLICIT=1; shift ;;
+      --max-cpus)   MAX_CPUS="${2:?--max-cpus needs a value}"; shift 2 ;;
+      --max-cpus=*) MAX_CPUS="${1#*=}"; shift ;;
+      --max-memory)   MAX_MEMORY="${2:?--max-memory needs a value}"; shift 2 ;;
+      --max-memory=*) MAX_MEMORY="${1#*=}"; shift ;;
+      --resize) RESIZE=1; shift ;;
       --)      shift; passthru+=("$@"); break ;;
       *)       passthru+=("$1"); shift ;;
     esac
   done
 
+  resolve_limits
   ensure_msb
 
   # The clipboard watcher reads the macOS pasteboard (pngpaste/pbpaste/osascript);
@@ -843,10 +942,12 @@ main() {
         clip_mount=(--mount-dir "${CLIP_SHARED}:/run/vm-clip:rw")
       fi
       if vm_exists; then
+        if [ "$RESIZE" = "1" ]; then apply_resize; fi
         msb exec -t "$NAME" -- sh -lc "$(clip_guest_setup_cmd)export IS_SANDBOX=1; exec sh -l"
       else
         msb run -t --name "$NAME" --replace \
           --cpus "$CPUS" --memory "$MEMORY" --root-disk "$DISK" \
+          ${MAX_FLAGS[@]+"${MAX_FLAGS[@]}"} \
           --mount-dir "${MOUNT_DIR}:/workspace:rw" \
           ${clip_mount[@]+"${clip_mount[@]}"} \
           --workdir "$GUEST_WORKDIR" \
@@ -864,8 +965,12 @@ main() {
       arm_sign_on_exit
       start_watcher
       if vm_exists; then
+        if [ "$RESIZE" = "1" ]; then apply_resize; fi
         resume ${passthru[@]+"${passthru[@]}"}
       else
+        if [ "$RESIZE" = "1" ]; then
+          echo "vm-claude: no VM for this project yet -- booting one at the requested size." >&2
+        fi
         start_fresh ${passthru[@]+"${passthru[@]}"}
       fi ;;
   esac

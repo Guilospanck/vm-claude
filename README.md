@@ -32,6 +32,12 @@ vm-claude --rm            # stop + delete the VM (wipes its auth/session state)
 vm-claude --sign-on-exit  # sign the commits the VM made, on the host, on exit
 vm-claude --no-clip       # disable the clipboard bridge (on by default)
 vm-claude --worktree NAME # run in a git worktree (created if missing), same VM
+vm-claude --cpus 4 --memory 8G --disk 16G
+                          # sizes for this run (a new VM boots with them; an
+                          # existing one needs --resize)
+vm-claude --max-cpus 8 --max-memory 32G
+                          # headroom a later --resize can grow into
+vm-claude --resize        # push the sizes above onto the existing VM
 vm-claude -- <args...>    # pass args straight through to `claude`
 ```
 
@@ -234,6 +240,8 @@ All configuration is via environment variables:
 | `CLAUDE_VM_CPUS` | `2` | vCPUs |
 | `CLAUDE_VM_MEMORY` | `4G` | RAM |
 | `CLAUDE_VM_DISK` | `4G` | Root disk size |
+| `CLAUDE_VM_MAX_CPUS` | same as `CLAUDE_VM_CPUS` | Ceiling a live `--resize` can raise vCPUs to; fixed when the VM boots |
+| `CLAUDE_VM_MAX_MEMORY` | same as `CLAUDE_VM_MEMORY` | Ceiling a live `--resize` can raise RAM to; fixed when the VM boots |
 | `CLAUDE_VM_MOUNT` | git repo root of `$PWD`, else `$PWD` | Host directory mounted as `/workspace` |
 | `CLAUDE_VM_SKIP_PERMISSIONS` | `1` | `1` passes `--dangerously-skip-permissions`; `0` keeps the prompts |
 | `CLAUDE_VM_SIGN_ON_EXIT` | host `commit.gpgsign` | `1`/`0` forces `--sign-on-exit` on/off; unset, it defaults on when the host has `commit.gpgsign=true` |
@@ -254,6 +262,69 @@ CLAUDE_VM_MOUNT=~/code/other-project vm-claude
 The default image is the AWS ECR public mirror of Docker's official Node image — anonymous pulls, no Docker Hub rate limits or `401`s. Point `CLAUDE_VM_IMAGE` at a Docker Hub tag if you'd rather use that.
 
 Setting `CLAUDE_VM_MOUNT` explicitly also disables the git-root detection: the directory you name is mounted as-is. Since the VM name is derived from that path, a different mount means a different VM with its own state.
+
+## Resizing a VM
+
+`CLAUDE_VM_CPUS`, `CLAUDE_VM_MEMORY` and `CLAUDE_VM_DISK` (or `--cpus`, `--memory`, `--disk`) apply when a VM is **created**. On an existing VM they're ignored unless you add `--resize`:
+
+```bash
+vm-claude --resize --cpus 4 --memory 8G            # live, the VM keeps running
+vm-claude --resize --disk 32G                      # reboots, to grow the disk
+vm-claude --resize --max-cpus 8 --max-memory 32G   # reboots, to raise the ceiling
+```
+
+Only CPU and RAM change live. Anything else — a bigger disk, a higher ceiling — needs a reboot, which `--resize` handles for you. That reboot is not a `--rm`: the VM's disk, auth and session history all survive it.
+
+| Change | Boundary |
+| --- | --- |
+| CPU / RAM, within the ceiling | live |
+| CPU / RAM ceiling (`--max-cpus`, `--max-memory`) | reboot |
+| Root disk (grow only) | reboot |
+
+One trap worth knowing up front: `--resize` includes the disk whenever a disk size was asked for, **and a `CLAUDE_VM_DISK` exported in your shell profile counts**. Export it and every `--resize` reboots, even a plain CPU bump. Pass `--disk` per run instead if that bothers you.
+
+### Ceilings
+
+CPU and RAM grow live only up to a ceiling fixed when the VM booted, and that ceiling defaults to the VM's starting size — so a VM booted without `--max-*` can be resized down but not up. Ask for headroom the first time:
+
+```bash
+vm-claude --cpus 2 --memory 4G --max-cpus 8 --max-memory 32G
+```
+
+It's a limit, not a reservation: it costs nothing until claimed, so set it generously. Raising it later works too, at the price of one reboot. `msb ps` shows the current allocation as `effective / max`.
+
+The root disk only ever grows. Shrinking it isn't possible — the only way down is `--rm` and a fresh VM.
+
+A refused resize — no headroom, a shrink, or an `msb` too old to have `modify` — is reported, and the session continues at the VM's current size. It never blocks the run. `--resize` on a project with no VM yet does nothing, since a fresh boot already uses whatever sizes you passed.
+
+### Checking what a VM actually got
+
+From inside the guest:
+
+```bash
+nproc                                                        # vCPUs
+awk '/MemTotal/{printf "%.2f GiB\n", $2/1048576}' /proc/meminfo
+df -h /                                                      # root disk
+```
+
+The base image ships without `procps`, so there's no `free` or `top` unless you `apt-get install -y procps`.
+
+### VMs created before this existed
+
+They keep working, and nothing about a plain `vm-claude` run changed. What they don't have is headroom: they booted with the ceiling defaulted to their starting size, so `--resize` can only shrink their CPU/RAM until you give them room. That doesn't need a `--rm` — one reboot is enough, and the VM's disk, auth and session history survive it:
+
+```bash
+vm-claude --resize --max-cpus 8 --max-memory 32G   # one-time, per project VM
+vm-claude --resize --cpus 6                        # from then on, live
+```
+
+Growing an old VM's disk works right away, with no prior setup — the root disk was never ceiling-bound, only reboot-bound:
+
+```bash
+vm-claude --resize --disk 32G
+```
+
+Both need an `msb` new enough to have `modify` (`msb self update` if not). vm-claude only sends `--max-cpus`/`--max-memory` when you actually ask for a ceiling, so an older `msb` keeps working for everything else.
 
 ## Notes and caveats
 
