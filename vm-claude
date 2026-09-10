@@ -22,7 +22,8 @@
 #                             # at boot, on an existing one only with --resize
 #   vm-claude --resize        # push those sizes onto the EXISTING VM: cpu/ram
 #                             # change live; a disk size or a new --max-* ceiling
-#                             # reboots it (keeping its disk/auth/session state)
+#                             # reboots it (keeping its disk/auth/session state);
+#                             # a --disk the VM already has is skipped, not fatal
 #   vm-claude -- <args...>    # pass args straight to `claude`
 #
 # claude runs with --dangerously-skip-permissions by default: the microVM is
@@ -440,32 +441,59 @@ resolve_limits() {
 # given headroom -- `--resize --max-cpus N --max-memory X` costs one restart.
 # Best-effort by design -- a refused resize (no headroom, a shrink, an msb
 # without `modify`) is reported and the session continues at the current size.
-apply_resize() {
-  local flags=(--cpus "$CPUS" --memory "$MEMORY")
-  local what="${CPUS} cpu / ${MEMORY} ram"
+#
+# `msb modify` is all-or-nothing: one refused arm and NOTHING is applied. The
+# disk arm is the one that trips on a harmless re-run -- the same `--disk 32G`
+# that grew the disk yesterday is a "shrink" today -- so that refusal is
+# retried without the disk, and cpu/ram still land.
+resize_flags() {
+  local with_disk="$1"
+  RESIZE_FLAGS=(--cpus "$CPUS" --memory "$MEMORY")
+  RESIZE_WHAT="${CPUS} cpu / ${MEMORY} ram"
   local reboot=0
-  if [ "$DISK_EXPLICIT" = "1" ]; then
-    flags+=(--root-disk "$DISK")
-    what="${what} / ${DISK} disk"
+  if [ "$with_disk" = "1" ]; then
+    RESIZE_FLAGS+=(--root-disk "$DISK")
+    RESIZE_WHAT="${RESIZE_WHAT} / ${DISK} disk"
     reboot=1
   fi
   if [ "$CEILING_SET" = "1" ]; then
-    flags+=("${MAX_FLAGS[@]}")
-    what="${what}, ceiling ${MAX_CPUS} cpu / ${MAX_MEMORY}"
+    RESIZE_FLAGS+=("${MAX_FLAGS[@]}")
+    RESIZE_WHAT="${RESIZE_WHAT}, ceiling ${MAX_CPUS} cpu / ${MAX_MEMORY}"
     reboot=1
   fi
   if [ "$reboot" = "1" ]; then
-    flags+=(--restart)
-    what="${what} (reboots the VM)"
+    RESIZE_FLAGS+=(--restart)
+    RESIZE_WHAT="${RESIZE_WHAT} (reboots the VM)"
   fi
-  echo "Resizing '${NAME}' -> ${what}..." >&2
-  if ! msb modify "$NAME" "${flags[@]}"; then
-    echo "vm-claude: resize refused; continuing at the VM's current size." >&2
-    echo "  cpu/ram grow only up to the ceiling the VM booted with ('msb ps'" >&2
-    echo "  shows effective / max); the root disk only grows. To raise the" >&2
-    echo "  ceiling, re-run with --resize --max-cpus N --max-memory X, which" >&2
-    echo "  reboots the VM but keeps its disk, auth and session history." >&2
+}
+
+apply_resize() {
+  local errf err
+  errf="$(mktemp)"
+  resize_flags "$DISK_EXPLICIT"
+  echo "Resizing '${NAME}' -> ${RESIZE_WHAT}..." >&2
+  if msb modify "$NAME" "${RESIZE_FLAGS[@]}" 2>"$errf"; then
+    cat "$errf" >&2; rm -f "$errf"; return 0
   fi
+  err="$(cat "$errf")"
+  # Disk already at (or above) the requested size: drop that arm and retry so
+  # the cpu/ram change is not lost with it.
+  if [ "$DISK_EXPLICIT" = "1" ] && printf '%s' "$err" | grep -q "root disk size is already"; then
+    echo "vm-claude: root disk is already >= ${DISK} and only grows; leaving it as is." >&2
+    resize_flags 0
+    echo "Resizing '${NAME}' -> ${RESIZE_WHAT}..." >&2
+    if msb modify "$NAME" "${RESIZE_FLAGS[@]}" 2>"$errf"; then
+      cat "$errf" >&2; rm -f "$errf"; return 0
+    fi
+    err="$(cat "$errf")"
+  fi
+  rm -f "$errf"
+  printf '%s\n' "$err" >&2
+  echo "vm-claude: resize refused; continuing at the VM's current size." >&2
+  echo "  cpu/ram grow only up to the ceiling the VM booted with ('msb ps'" >&2
+  echo "  shows effective / max); the root disk only grows. To raise the" >&2
+  echo "  ceiling, re-run with --resize --max-cpus N --max-memory X, which" >&2
+  echo "  reboots the VM but keeps its disk, auth and session history." >&2
 }
 
 # Emit `git config --global` commands for the SAFE subset of the host config.

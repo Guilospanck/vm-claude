@@ -283,6 +283,8 @@ Only CPU and RAM change live. Anything else — a bigger disk, a higher ceiling 
 
 One trap worth knowing up front: `--resize` includes the disk whenever a disk size was asked for, **and a `CLAUDE_VM_DISK` exported in your shell profile counts**. Export it and every `--resize` reboots, even a plain CPU bump. Pass `--disk` per run instead if that bothers you.
 
+Re-running the same `--resize --disk 32G` is fine, though: `msb modify` is all-or-nothing and would refuse the whole thing because the disk is already 32G, so vm-claude notices that refusal, says so, and retries without the disk. The CPU/RAM part still lands.
+
 ### Ceilings
 
 CPU and RAM grow live only up to a ceiling fixed when the VM booted, and that ceiling defaults to the VM's starting size — so a VM booted without `--max-*` can be resized down but not up. Ask for headroom the first time:
@@ -295,7 +297,7 @@ It's a limit, not a reservation: it costs nothing until claimed, so set it gener
 
 The root disk only ever grows. Shrinking it isn't possible — the only way down is `--rm` and a fresh VM.
 
-A refused resize — no headroom, a shrink, or an `msb` too old to have `modify` — is reported, and the session continues at the VM's current size. It never blocks the run. `--resize` on a project with no VM yet does nothing, since a fresh boot already uses whatever sizes you passed.
+A refused resize — no headroom, a CPU/RAM shrink below what's allowed, or an `msb` too old to have `modify` — is reported, and the session continues at the VM's current size. It never blocks the run. `--resize` on a project with no VM yet does nothing, since a fresh boot already uses whatever sizes you passed.
 
 ### Checking what a VM actually got
 
