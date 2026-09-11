@@ -2,7 +2,7 @@
 
 `vm-claude` runs Claude Code inside a [microsandbox](https://docs.microsandbox.dev) microVM instead of directly on your machine.
 
-The point is isolation: the guest sees **only the current project**, mounted read-write at `/workspace`. Everything else on the host — your home directory, SSH keys, other repos, system files — is simply not there, so a stray `rm -rf` or an over-eager tool call can't reach it.
+The point is isolation: the guest sees **only the current project**, mounted read-write at `/workspace`. Everything else on the host — your home directory, SSH keys, other repos, system files — is simply not there, so a stray `rm -rf` or an over-eager tool call can't reach it. The one door back to the host is the project itself, `.git` included — see [The repo is guest-writable](#the-repo-is-guest-writable).
 
 Because the VM is already the sandbox, `claude` is started with `--dangerously-skip-permissions` by default — no permission prompts inside the box. See [Permissions](#permissions).
 
@@ -27,6 +27,7 @@ install -m 755 vm-claude ~/.local/bin/vm-claude
 ```bash
 vm-claude                 # run claude in a VM for the current project
 vm-claude --shell         # drop into a shell in the VM instead of running claude
+vm-claude --show-config   # list the ~/.claude files a run would copy in (starts nothing)
 vm-claude --stop          # stop this project's VM
 vm-claude --rm            # stop + delete the VM (wipes its auth/session state)
 vm-claude --sign-on-exit  # sign the commits the VM made, on the host, on exit
@@ -76,19 +77,41 @@ No signing key and no git credentials are ever copied into the guest, so commits
 vm-claude --sign-on-exit
 ```
 
-It records `HEAD` before starting the VM and, when the VM exits, signs whatever was committed in the meantime with your host key. When it arms it says so — `sign-on-exit: armed at <sha>` — so an active hook is distinguishable from a flag you forgot to pass. `--shell` sessions are covered too, and so are the messy exits: it signs on a clean `/q`, on Ctrl-C, and when you just close the terminal (`SIGINT`/`SIGTERM`/`SIGHUP`), not only on a graceful shutdown. This works because `/workspace` **is** your host repo — the git root is what's mounted, so commits made in the guest are already real objects in the host's `.git`; only the signature is missing. The hook re-creates them out here, where the key lives:
+It records `HEAD` before starting the VM and, when the VM exits, signs whatever was committed in the meantime with your host key. When it arms it says so — `sign-on-exit: armed at <sha>` — so an active hook is distinguishable from a flag you forgot to pass. `--shell` sessions are covered too, and so are the messy exits: it signs on a clean `/q`, on Ctrl-C, and when you just close the terminal (`SIGINT`/`SIGTERM`/`SIGHUP`), not only on a graceful shutdown. This works because `/workspace` **is** your host repo — the git root is what's mounted, so commits made in the guest are already real objects in the host's `.git`; only the signature is missing. The hook re-creates them out here, where the key lives.
 
-```bash
-git rebase --force-rebase --gpg-sign --autostash <HEAD before the VM ran>
-```
+It does that **without letting the repo run anything on your host**. The VM can write the repo's `.git/config` and `.git/hooks`, and git honours both, so a plain `git rebase -S` on the host would run whatever `gpg.ssh.program`, `core.fsmonitor` or hook the session planted — as you, with your keys. Instead the hook:
 
-`--force-rebase` is the load-bearing flag. A plain `git rebase -S origin/main` onto an ancestor fast-forwards, re-creates no commits, and therefore signs nothing — a quiet no-op that looks like a signing failure.
+- reads your signing settings (`user.*`, `gpg.format`, `gpg.*program`, `user.signingkey`) from your **global** git config before the VM starts, never from the repo;
+- re-creates each new commit with `git commit-tree -S` in a throwaway git directory that shares only the repo's object store, so no repo config and no hooks are in play;
+- moves the branch with a compare-and-swap `update-ref`, hooks disabled.
 
-It's already the default when your host is set up to sign commits anyway — if `commit.gpgsign` is `true` in your global git config, every `vm-claude` run arms it without the flag. Set `CLAUDE_VM_SIGN_ON_EXIT=1` to force it on regardless (or `=0` / `--no-sign-on-exit` to turn it off for one run). The hook deliberately does nothing and tells you so when it can't act safely: a detached `HEAD`, no new commits, or a history that diverged from where it started (a rebase or reset inside the VM), since rewriting from the old base would discard work. If the rebase itself fails it runs `git rebase --abort` and prints the command to retry by hand — it never leaves you mid-rebase.
+Trees, authors, author dates and messages are kept exactly; merges keep their parents; the committer becomes your global identity. Because the trees are identical, the index and working tree aren't touched — uncommitted work stays as it was, no autostash.
+
+It's already the default when your host is set up to sign commits anyway — if `commit.gpgsign` is `true` in your global git config, every `vm-claude` run arms it without the flag. Set `CLAUDE_VM_SIGN_ON_EXIT=1` to force it on regardless (or `=0` / `--no-sign-on-exit` to turn it off for one run). The hook deliberately does nothing and tells you so when it can't act safely: a detached `HEAD`, no new commits, or a history that diverged from where it started (a rebase or reset inside the VM), since rewriting from the old base would discard work. If signing fails, nothing is rewritten and it prints the command to retry by hand — review `.git/config` and `.git/hooks` before running it.
 
 Signing rewrites the commits, so their hashes change. Run it before pushing, not after.
 
 Two things it deliberately cannot do. It only signs commits made **during that run** — anything already unsigned when the VM started sits below the recorded base and stays untouched, so catch those up by hand with `git rebase -f -S <last good commit>`. And the hook lives in the running `vm-claude` process: editing the script, or deciding to enable the flag, does nothing for a session that is already up. A VM started without it will exit without it.
+
+## The repo is guest-writable
+
+The project directory is mounted read-write, `.git` and all, and inside the VM Claude runs as root with permission prompts off. Treat everything in the repo as something the session may have changed — including the parts **host git executes**:
+
+- `.git/config` entries such as `core.fsmonitor`, `core.hooksPath`, `gpg.program`, `diff.*.textconv`, `filter.*.smudge`, aliases;
+- hooks in `.git/hooks/` (or wherever `core.hooksPath` points);
+- tracked scripts your tooling runs (`package.json` scripts, `Makefile`, `.envrc`, husky hooks).
+
+`vm-claude` keeps its own git calls from running any of that: every host git command it issues on the repo disables hooks and fsmonitor, signing runs outside the repo's config (above), and `--worktree` refuses to create a checkout if the repo defines filter drivers or config includes, or if its target path is a symlink.
+
+What it can't protect is **your** next git command. So on exit it compares the repo's executable config and hooks against what was there before the session and warns if anything was added or changed:
+
+```text
+warning: this session added or changed executable git config in /path/to/repo/.git:
+  core.fsmonitor
+  hook /path/to/repo/.git/hooks/post-checkout
+```
+
+If you see that and didn't do it yourself, inspect and remove it before running git in that repo — `git config --file .git/config --list` reads the file without executing anything. Setting these in your global config won't help: a repo's own config overrides global. For tracked tooling, `git diff` the session's changes before you run them.
 
 ## Git worktrees
 
@@ -125,6 +148,14 @@ untracked and gitignored file from the main working tree into the new worktree
 (via `git ls-files --others [--ignored]` piped through `tar`). This happens
 **only when the worktree is created** — later runs leave the worktree's own
 copies alone, so edits you make to its `.env` inside the VM stick.
+
+**Creation refuses when the repo could run code on the host.** The checkout
+happens on the host, in a repo the VM can write. Hooks and fsmonitor are
+disabled for it, but filter drivers (`filter.*.smudge`) can't be switched off
+by name, so if the repo's own config defines any, or pulls in other config via
+`include.path`/`includeIf`, `vm-claude` stops and lists them. It also refuses
+when `.vm-worktrees` or the worktree path is a symlink. See
+[The repo is guest-writable](#the-repo-is-guest-writable).
 
 `--sign-on-exit` follows the worktree: it records and re-signs `HEAD` on the
 worktree's branch, not the repo root's. Removing a worktree is manual — the tool
@@ -190,8 +221,10 @@ The base image runs UTC, which would stamp every commit made in the VM with a `+
 
 1. The mount directory (default `$PWD`) is resolved to an absolute path. If it's inside a git repo, the **repo root** is mounted instead, so `.git` is visible in the guest, and the sub-path is remembered so you land in the equivalent directory under `/workspace`.
 2. That path is hashed, producing a stable VM name like `vm-claude-my-project-1234567890`. Each project therefore gets its own persistent VM.
-3. **First run** — `msb run` boots the base image with the project mounted at `/workspace`, then inside the guest installs `ca-certificates`, `git`, and `tzdata`, pins the timezone, copies over a safe subset of your host git config (see below), runs `npm install -g @anthropic-ai/claude-code@<version>`, unpacks a safe subset of your `~/.claude` config (see below), and execs `claude`.
-4. **Later runs** — the VM already exists, so it's resumed with `msb exec` and `claude` starts right up. `claude` is re-installed at `CLAUDE_VM_VERSION` on the way in so each session picks up the latest release (skipped gracefully if the install fails — the version already in the VM is used); you stay logged in, and the `~/.claude` subset is refreshed from the host too.
+3. **First run** — `msb run` boots the base image with the project mounted at `/workspace` and your `~/.claude` bundle copied in (see below). Inside the guest it installs `ca-certificates`, `git`, and `tzdata`, pins the timezone, copies over a safe subset of your host git config (see below), runs `npm install -g @anthropic-ai/claude-code@<version>`, swaps in the `~/.claude` bundle, and execs `claude`.
+4. **Later runs** — the VM already exists, so the bundle is streamed in over `msb exec --stream` and the session is resumed with `msb exec`. `claude` is re-installed at `CLAUDE_VM_VERSION` on the way in so each session picks up the latest release (skipped gracefully if the install fails — the version already in the VM is used); you stay logged in, and the `~/.claude` config is refreshed from the host too.
+
+`--shell` goes through exactly the same setup as a normal run (fresh boot or resume) and just execs a shell at the end instead of `claude`.
 5. `--stop` shuts the VM down but keeps its disk. `--rm` deletes it, which also destroys the stored credentials and session history for that project.
 
 The first run in a project boots the base image and installs the OS packages, so expect a minute or two; later runs skip all that and only refresh `claude` itself, so they start in a few seconds.
@@ -206,15 +239,29 @@ Anything that could carry a secret — `credential.*`, `*.token`, `user.signingk
 
 The guest has its own `~/.claude` — that's where its auth and session state live — so without help it would start with none of your actual configuration: no global `CLAUDE.md`, no settings, no custom agents or commands. On every run `vm-claude` copies an allowlist of your host config in:
 
-`CLAUDE.md`, `settings.json`, `keybindings.json`, `agents/`, `commands/`, `skills/`, `hooks/`, `output-styles/`
+`CLAUDE.md`, `settings.json`, `keybindings.json`, `agents/`, `commands/`, `skills/`, `output-styles/`
+
+(`hooks/` used to be on the list. It isn't any more: the `hooks` key in `settings.json` never crosses, so the scripts were dead weight — often megabytes. A VM that still has an old copy loses it on its next run.)
 
 Everything else in `~/.claude` stays on the host. In particular `.credentials.json`, `history.jsonl`, `projects/` (the transcripts of every project you've ever run Claude in), `sessions/`, `shell-snapshots/` and the plugin repos are never sent — you still sign in separately inside each VM.
 
-The copy is a small gzipped tar inlined into the command that boots or resumes the VM, **not** a second mount. Mounting `~/.claude` would have been simpler, but it would put your credentials and every other project's transcripts inside the box for the VM's whole lifetime, which is the thing this tool exists to prevent.
+It's **not** a mount. Mounting `~/.claude` would have been simpler, but it would put your credentials and every other project's transcripts inside the box for the VM's whole lifetime, which is the thing this tool exists to prevent. Instead the allowlist is staged in a private temp dir on the host, cleaned there, packed into one tarball with a manifest, copied into the guest, checked against that manifest, and only then swapped in. A bundle that fails the check changes nothing.
 
-It runs on resumes too, not just the first boot, so edits to your host config show up on the next run. The flip side: those specific files are overwritten in the guest each time, so config changes made *inside* the VM don't stick. Everything not on the allowlist — including the VM's login — is left alone.
+Cleaning happens **on the host, before anything is copied**:
 
-`settings.json` gets one edit on the way in: a configurable set of top-level keys is deleted from the guest's copy. The default is `hooks statusLine` — the two keys that shell out to host-side executables (hooks and status-line scripts run by absolute path or host-only binary), none of which exist in the VM, so left in place they'd make every session event fire a hook that errors. Everything else — model, effort, plugins, permissions — is kept. Change the list with `CLAUDE_VM_SETTINGS_STRIP` (space-separated keys; `""` keeps everything, `"hooks statusLine env"` also drops `env`). The edit happens on the copy inside the guest; your host `settings.json` is untouched.
+- **Symlinks.** Exactly one shape is followed: `skills/<name>` pointing at `~/.agents/skills/<name>`, the layout skill installers create. It's copied in as a real directory. Every other link is dropped with a message: a dangling one, one pointing anywhere else, a top-level item that is itself a link (e.g. `CLAUDE.md` into a dotfiles repo), or a link nested inside a copied skill. Copying links as-is used to leave them dangling in the guest; following them blindly could pull any host file in.
+- **Credential-looking files** are dropped wherever they appear: `.credentials.json`, `credentials.json`, `auth.json`, `.netrc`, `.npmrc`, `.pypirc`, `history.jsonl`, `id_rsa`/`id_ed25519`/…, `*.pem`, `*.key`, `*.p12`, `.env`, `.env.*`.
+- **`settings.json`** loses `env`, `hooks`, `statusLine`, `apiKeyHelper`, `awsAuthRefresh`, `awsCredentialExport` and `otelHeadersHelper` — always. `env` is where tokens usually live; the rest run host-side commands that don't exist in the VM. Add more keys with `CLAUDE_VM_SETTINGS_STRIP`. This needs `jq`, `node` or `python3` on the host; if none is there, or the file isn't a JSON object, `settings.json` is **not copied at all** rather than copied unsanitized. Your host `settings.json` is never modified.
+
+It runs on resumes too, not just the first boot, so edits to your host config show up on the next run. The copied entries are replaced wholesale each time, and an entry that disappears from the host (or from the allowlist) is removed from the guest too — so config changes made *inside* the VM to those entries don't stick. Everything else in the guest's `~/.claude` — including its login and transcripts — is left alone.
+
+See exactly what would go in, without starting anything:
+
+```bash
+vm-claude --show-config
+```
+
+Every run also prints a one-line summary (`config: copying 54 file(s), 235KB, ...`).
 
 Tune it with:
 
@@ -222,12 +269,10 @@ Tune it with:
 CLAUDE_VM_CONFIG=0 vm-claude                              # don't copy anything
 CLAUDE_VM_CONFIG_ITEMS="CLAUDE.md agents" vm-claude       # copy just these
 CLAUDE_VM_CONFIG_DIR=~/dotfiles/claude vm-claude          # copy from elsewhere
+CLAUDE_VM_SETTINGS_STRIP="permissions" vm-claude          # also drop these settings keys
 ```
 
-Two caveats worth knowing:
-
-- **`settings.json` goes across almost as-is.** `hooks` and `statusLine` are stripped in the guest (see above), but the rest is copied verbatim — so if yours has secrets in `env`, drop `settings.json` from `CLAUDE_VM_CONFIG_ITEMS`.
-- **There's a size ceiling**, 120 KB of compressed payload by default, because it travels as a single command-line argument and Linux caps those at 128 KB — the default leaves a little headroom under that hard limit. Over the limit, `vm-claude` says so and skips the copy rather than failing obscurely; trim `CLAUDE_VM_CONFIG_ITEMS` or raise `CLAUDE_VM_CONFIG_MAX_KB`.
+There's a **size ceiling**, 2 MB uncompressed by default. It isn't a transport limit (the bundle travels as a file); it's a guard against shipping far more of your machine than you meant to. Over the limit, `vm-claude` says so and copies nothing; check `--show-config`, then trim `CLAUDE_VM_CONFIG_ITEMS` or raise `CLAUDE_VM_CONFIG_MAX_KB`.
 
 ## Configuration
 
@@ -250,8 +295,8 @@ All configuration is via environment variables:
 | `CLAUDE_VM_CONFIG` | `1` | `1` copies the `~/.claude` allowlist into the guest; `0` skips it |
 | `CLAUDE_VM_CONFIG_DIR` | `~/.claude` | Host directory to copy that config from |
 | `CLAUDE_VM_CONFIG_ITEMS` | see [Claude config](#claude-config) | Space-separated allowlist of entries to copy |
-| `CLAUDE_VM_CONFIG_MAX_KB` | `120` | Size ceiling for the copied config, in KB |
-| `CLAUDE_VM_SETTINGS_STRIP` | `hooks statusLine` | Space-separated `settings.json` keys to drop in the guest; `""` keeps everything |
+| `CLAUDE_VM_CONFIG_MAX_KB` | `2048` | Size ceiling for the copied config, uncompressed, in KB |
+| `CLAUDE_VM_SETTINGS_STRIP` | *(none)* | Extra space-separated `settings.json` keys to drop; `env`, `hooks`, `statusLine` and the credential-helper keys are always dropped |
 | `CLAUDE_VM_WORKTREE_DIR` | `.vm-worktrees` | Subdir under the repo root that holds `--worktree` checkouts |
 
 ```bash
@@ -327,6 +372,14 @@ vm-claude --resize --disk 32G
 ```
 
 Both need an `msb` new enough to have `modify` (`msb self update` if not). vm-claude only sends `--max-cpus`/`--max-memory` when you actually ask for a ceiling, so an older `msb` keeps working for everything else.
+
+## Tests
+
+```bash
+test/run.sh
+```
+
+Host-only: no VM and no `msb` needed. It sources the script into throwaway repos and a throwaway `$HOME` and checks the security-relevant host logic. That covers signing against a repo whose `.git` has been poisoned, `--worktree` refusals, the config bundle's link/credential/settings handling, the guest-side swap-in, and that a fresh boot, a resume and `--shell` all run the same setup.
 
 ## Notes and caveats
 

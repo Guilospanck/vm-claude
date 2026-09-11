@@ -11,6 +11,7 @@
 # Usage:
 #   vm-claude                 # run claude in a VM for $PWD
 #   vm-claude --shell         # drop into a shell in the VM instead
+#   vm-claude --show-config   # list the ~/.claude files a run would copy in
 #   vm-claude --stop          # stop this project's VM
 #   vm-claude --rm            # stop + delete VM (wipes its auth/session state)
 #   vm-claude --sign-on-exit  # sign the VM's commits on the host when it exits
@@ -53,9 +54,9 @@
 #                       guest; 0 leaves the guest with a virgin config
 #   CLAUDE_VM_CONFIG_DIR    host config dir to copy from (default ~/.claude)
 #   CLAUDE_VM_CONFIG_ITEMS  space-separated allowlist of entries to copy
-#   CLAUDE_VM_CONFIG_MAX_KB size ceiling for that payload  (default 120)
-#   CLAUDE_VM_SETTINGS_STRIP  settings.json keys to drop in the guest
-#                       (default "hooks statusLine"; "" keeps everything)
+#   CLAUDE_VM_CONFIG_MAX_KB size ceiling for that copy, uncompressed (default 2048)
+#   CLAUDE_VM_SETTINGS_STRIP  extra settings.json keys to drop (env, hooks,
+#                       statusLine and credential helpers are always dropped)
 #   CLAUDE_VM_CLIP      1 (default) bridges the macOS clipboard into the guest so
 #                       Claude's Ctrl-V image paste works, approving each paste
 #                       via a host dialog; 0 (or --no-clip) turns it off. macOS
@@ -116,17 +117,17 @@ fi
 # history, transcripts, other projects' state — stays on the host.
 CONFIG_SYNC="${CLAUDE_VM_CONFIG:-1}"
 CONFIG_SRC="${CLAUDE_VM_CONFIG_DIR:-$HOME/.claude}"
-CONFIG_ITEMS="${CLAUDE_VM_CONFIG_ITEMS:-CLAUDE.md settings.json keybindings.json agents commands skills hooks output-styles}"
-CONFIG_MAX_KB="${CLAUDE_VM_CONFIG_MAX_KB:-120}"
-CONFIG_B64=""
+# hooks/ isn't on the list: settings.json's `hooks` key never crosses (see
+# CONFIG_STRIP_ALWAYS), so the scripts would be dead weight -- often megabytes.
+CONFIG_ITEMS="${CLAUDE_VM_CONFIG_ITEMS:-CLAUDE.md settings.json keybindings.json agents commands skills output-styles}"
+# Ceiling on the uncompressed size of what gets copied: a guard against
+# shipping far more of the host than intended, not a transport limit.
+CONFIG_MAX_KB="${CLAUDE_VM_CONFIG_MAX_KB:-2048}"
 
-# Top-level keys deleted from the shipped settings.json inside the guest. Both
-# defaults name host-side execution: `hooks` and `statusLine` run commands by
-# absolute path or host-only binary, none of which exist in the VM, so left in
-# they make every session event fire a hook that errors. This is a plain key
-# list, not tied to any particular config -- set it to "" to keep everything, or
-# add keys (e.g. "env") to drop more. Use `-` so an explicit "" means "keep all".
-CONFIG_STRIP="${CLAUDE_VM_SETTINGS_STRIP-hooks statusLine}"
+# EXTRA top-level keys to delete from the shipped settings.json, on the host,
+# before it's copied. The always-stripped set (env, hooks, statusLine, and the
+# credential-helper commands) is in CONFIG_STRIP_ALWAYS and can't be turned off.
+CONFIG_STRIP="${CLAUDE_VM_SETTINGS_STRIP:-}"
 
 # --- clipboard bridge (opt-in) ---------------------------------------------
 # Claude Code reads a pasted image by shelling out to `xclip`/`wl-paste` in the
@@ -278,7 +279,8 @@ MOUNT_DIR="$(cd "$MOUNT_DIR" && pwd)"
 # and remember the sub-path so we land in the same dir inside /workspace.
 SUBPATH=""
 if [ -z "${CLAUDE_VM_MOUNT:-}" ] && command -v git >/dev/null 2>&1; then
-  if root="$(cd "$MOUNT_DIR" && git rev-parse --show-toplevel 2>/dev/null)"; then
+  # Hooks/fsmonitor off, as for every host git call on the repo (see hgit below).
+  if root="$(cd "$MOUNT_DIR" && git -c core.hooksPath=/dev/null -c core.fsmonitor=false rev-parse --show-toplevel 2>/dev/null)"; then
     SUBPATH="${MOUNT_DIR#"$root"}"   # e.g. "" or "/sub/dir"
     MOUNT_DIR="$root"
   fi
@@ -309,7 +311,7 @@ if [ -n "$WORKTREE_NAME" ]; then
   command -v git >/dev/null 2>&1 || {
     echo "vm-claude: --worktree needs git on the host." >&2; exit 1
   }
-  if ! WT_ROOT="$(cd "$MOUNT_DIR" && git rev-parse --show-toplevel 2>/dev/null)"; then
+  if ! WT_ROOT="$(cd "$MOUNT_DIR" && git -c core.hooksPath=/dev/null -c core.fsmonitor=false rev-parse --show-toplevel 2>/dev/null)"; then
     echo "vm-claude: --worktree needs to be run inside a git repo (${MOUNT_DIR} isn't one)." >&2
     exit 1
   fi
@@ -528,94 +530,382 @@ host_git_config() {
 # so out of the box it has none of the user's actual configuration: no global
 # CLAUDE.md, no settings, no custom agents/commands/skills.
 #
-# Ship those across as a gzipped tar, base64'd and inlined into the command we
-# already run in the guest. Deliberately NOT a second --mount-dir: a mount of
-# ~/.claude would put .credentials.json and every other project's transcripts
-# inside the box for the life of the VM, which is exactly what this tool exists
-# to avoid. Only the allowlisted entries ever leave the host.
-#
-# Prints the base64 payload on stdout, or nothing if there is nothing to send.
-build_config_payload() {
+# Ship an allowlisted, sanitized copy of those as one tarball. It's staged in a
+# private host dir, copied into the guest (--copy-file on a fresh boot, streamed
+# over `msb exec --stream` on resume), checked against its manifest there and
+# only then swapped in. Deliberately NOT a mount of ~/.claude: that would put
+# .credentials.json and every other project's transcripts inside the box for
+# the life of the VM, which is exactly what this tool exists to avoid. Only what
+# is staged here ever leaves the host.
+CONFIG_TMP=""
+CONFIG_BUNDLE=""
+GUEST_BUNDLE=""
+GUEST_STATE_DIR=/var/lib/vm-claude
+
+# settings.json keys that never cross, whatever CLAUDE_VM_SETTINGS_STRIP says:
+# env is where people keep tokens, and the rest name host-side commands (hooks,
+# status line, credential helpers) that don't exist in the guest.
+CONFIG_STRIP_ALWAYS="env hooks statusLine apiKeyHelper awsAuthRefresh awsCredentialExport otelHeadersHelper"
+
+# Basenames that are never shipped, wherever they turn up in the copied tree.
+config_denied() {
+  case "$1" in
+    .credentials.json|credentials.json|auth.json|.netrc|.npmrc|.pypirc|history.jsonl) return 0 ;;
+    id_rsa|id_rsa.*|id_dsa|id_dsa.*|id_ecdsa|id_ecdsa.*|id_ed25519|id_ed25519.*) return 0 ;;
+    *.pem|*.key|*.p12|*.pfx|.env|.env.*) return 0 ;;
+  esac
+  return 1
+}
+
+# Write settings.json ($1) to $2 minus the stripped keys. Fails closed: unless
+# the input parses as a JSON object and a JSON tool is on the host, nothing is
+# written -- an unsanitized settings.json never reaches the guest.
+sanitize_settings() {
+  local src="$1" dst="$2" keys="$CONFIG_STRIP_ALWAYS $CONFIG_STRIP"
+  rm -f "$dst" "$dst.tmp"
+  if command -v jq >/dev/null 2>&1; then
+    jq --arg keys "$keys" \
+      'if type == "object" then reduce ($keys | split(" ")[] | select(length > 0)) as $k (.; del(.[$k])) else error("not an object") end' \
+      "$src" > "$dst.tmp" 2>/dev/null
+  elif command -v node >/dev/null 2>&1; then
+    node -e 'const fs = require("fs"); const [src, dst, keys] = process.argv.slice(1);
+      const s = JSON.parse(fs.readFileSync(src, "utf8"));
+      if (s === null || typeof s !== "object" || Array.isArray(s)) process.exit(1);
+      for (const k of keys.split(/\s+/).filter(Boolean)) delete s[k];
+      fs.writeFileSync(dst, JSON.stringify(s, null, 2) + "\n");' "$src" "$dst.tmp" "$keys" 2>/dev/null
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import json, sys
+s = json.load(open(sys.argv[1]))
+if not isinstance(s, dict): sys.exit(1)
+for k in sys.argv[3].split(): s.pop(k, None)
+json.dump(s, open(sys.argv[2], "w"), indent=2)' "$src" "$dst.tmp" "$keys" 2>/dev/null
+  else
+    return 1
+  fi && [ -s "$dst.tmp" ] && mv -f "$dst.tmp" "$dst" || { rm -f "$dst.tmp"; return 1; }
+}
+
+# Physical path of the directory the symlink $1 points at (resolved from where
+# the link itself lives), or failure when it's dangling or not a directory.
+link_dir_target() {
+  local t
+  t="$(readlink "$1")" || return 1
+  (cd -P "$(dirname "$1")" 2>/dev/null && cd -P "$t" 2>/dev/null && pwd -P)
+}
+
+# Symlinks in the staged copy ($1). Exactly one shape is followed:
+# skills/<name> -> ~/.agents/skills/<name>, the layout skill installers use,
+# which is copied in as a real directory. Each link is resolved from its
+# ORIGINAL place under CONFIG_SRC, not from the stage. Every other link --
+# dangling, pointing anywhere else, a top-level item, or nested inside a copied
+# package -- is dropped with a warning: following it could pull any host file in.
+materialize_config_links() {
+  local stage="$1" agents link rel target
+  agents="$(cd -P "$HOME/.agents/skills" 2>/dev/null && pwd -P)" || agents=""
+
+  if [ -n "$agents" ] && [ -d "$stage/skills" ]; then
+    while IFS= read -r -d '' link; do
+      rel="${link#"$stage"/}"
+      target="$(link_dir_target "${CONFIG_SRC}/${rel}")" || continue
+      [ "$target" = "${agents}/${rel#skills/}" ] || continue
+      rm -f "$link" && cp -R "$target" "$link" \
+        || echo "config: could not copy ~/.claude/${rel} from ${target}; skipping it." >&2
+    done < <(find "$stage/skills" -mindepth 1 -maxdepth 1 -type l -print0)
+  fi
+
+  while IFS= read -r -d '' link; do
+    rel="${link#"$stage"/}"
+    echo "config: skipped ~/.claude/${rel} (symlink to $(readlink "$link"); only skills/<name> -> ~/.agents/skills/<name> is followed)" >&2
+    rm -f "$link"
+  done < <(find "$stage" -type l -print0)
+}
+
+# Remove denylisted names from the stage ($1), saying so.
+drop_denied_config() {
+  local stage="$1" p
+  while IFS= read -r -d '' p; do
+    config_denied "${p##*/}" || continue
+    [ -e "$p" ] || continue          # already gone with a denied parent
+    echo "config: skipped ~/.claude/${p#"$stage"/} (looks like a credential)" >&2
+    rm -rf "$p"
+  done < <(find "$stage" -mindepth 1 -print0)
+}
+
+# Stage the allowlist, sanitize it, and pack it into CONFIG_BUNDLE (left empty
+# when there is nothing to send, or it's over the size cap).
+build_config_bundle() {
+  CONFIG_BUNDLE=""
+  GUEST_BUNDLE=""
   [ "$CONFIG_SYNC" != "0" ] || return 0
   [ -d "$CONFIG_SRC" ] || return 0
-  command -v tar >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1 || {
-    echo "warning: tar/base64 not found on the host, skipping ~/.claude config." >&2
+  command -v tar >/dev/null 2>&1 || {
+    echo "warning: tar not found on the host, skipping ~/.claude config." >&2
     return 0
   }
 
+  CONFIG_TMP="$(mktemp -d "${TMPDIR:-/tmp}/vm-claude-config.XXXXXX")" || return 0
+  chmod 700 "$CONFIG_TMP"
+  ensure_traps
+  local stage="${CONFIG_TMP}/stage" item items="" n bytes kb
+  mkdir -p "$stage/claude"
+
   # CONFIG_ITEMS is intentionally split on whitespace; entries can't contain it.
-  local present=() item
   for item in $CONFIG_ITEMS; do
-    [ -e "${CONFIG_SRC}/${item}" ] && present+=("$item")
+    case "$item" in
+      .|..|*/*|*[!A-Za-z0-9._-]*) echo "config: ignoring item '${item}' (must be a plain file or dir name)" >&2; continue ;;
+    esac
+    [ -e "${CONFIG_SRC}/${item}" ] || [ -L "${CONFIG_SRC}/${item}" ] || continue
+    items="${items} ${item}"
+    if [ "$item" = settings.json ] && [ ! -L "${CONFIG_SRC}/${item}" ]; then
+      sanitize_settings "${CONFIG_SRC}/${item}" "${stage}/claude/${item}" \
+        || echo "warning: could not sanitize ${CONFIG_SRC}/settings.json (not a JSON object, or no jq/node/python3 on the host); not copying it." >&2
+      continue
+    fi
+    cp -RP "${CONFIG_SRC}/${item}" "${stage}/claude/${item}" \
+      || echo "warning: could not fully copy ${CONFIG_SRC}/${item}; the guest gets what was readable." >&2
   done
-  [ ${#present[@]} -gt 0 ] || return 0
+
+  materialize_config_links "$stage/claude"
+  drop_denied_config "$stage/claude"
+
+  n="$(find "$stage/claude" -type f | wc -l | tr -d ' ')"
+  bytes="$(find "$stage/claude" -type f -exec cat {} + 2>/dev/null | wc -c | tr -d ' ')"
+  kb=$(( (bytes + 1023) / 1024 ))
+  if [ "$kb" -gt "$CONFIG_MAX_KB" ]; then
+    echo "warning: ~/.claude subset is ${kb}KB (limit ${CONFIG_MAX_KB}KB), not copying into the guest." >&2
+    echo "  see what's in it with --show-config; trim CLAUDE_VM_CONFIG_ITEMS or raise CLAUDE_VM_CONFIG_MAX_KB." >&2
+    return 0
+  fi
+
+  {
+    printf 'files %s\nbytes %s\n' "$n" "$bytes"
+    for item in $items; do printf 'item %s\n' "$item"; done
+  } > "$stage/MANIFEST"
 
   # macOS `tar` is bsdtar and stamps Apple xattrs (com.apple.provenance, ...)
   # into the archive; GNU tar in the guest can't read them and warns once per
-  # file. Strip that metadata at the source so the payload is plain portable tar.
+  # file. Strip that metadata at the source so the bundle is plain portable tar.
   local tar_flags=()
   case "$(uname -s)" in
     Darwin) tar_flags=(--no-mac-metadata --no-xattrs) ;;
   esac
+  tar ${tar_flags[@]+"${tar_flags[@]}"} -czf "${CONFIG_TMP}/config.tgz" -C "$stage" MANIFEST claude 2>/dev/null || {
+    echo "warning: could not pack the ~/.claude config; not copying it." >&2
+    return 0
+  }
+  CONFIG_BUNDLE="${CONFIG_TMP}/config.tgz"
+  # Unique per run, so two sessions on one VM (e.g. two worktrees) can't collide.
+  GUEST_BUNDLE="${GUEST_STATE_DIR}/inbox/config-$$-${RANDOM}.tgz"
+  echo "config: copying ${n} file(s), ${kb}KB, from ${CONFIG_SRC} into the guest (--show-config lists them)." >&2
+}
 
-  local b64 kb
-  # `base64` wraps by default on some platforms and not others; unwrap always.
-  b64="$(tar ${tar_flags[@]+"${tar_flags[@]}"} -czf - -C "$CONFIG_SRC" "${present[@]}" 2>/dev/null | base64 | tr -d '\n')" || return 0
-  [ -n "$b64" ] || return 0
-
-  # The payload rides in an argv entry, and Linux caps a single argument at
-  # 128 KiB. Refuse rather than get killed with a confusing E2BIG.
-  kb=$(( ${#b64} / 1024 ))
-  if [ "$kb" -gt "$CONFIG_MAX_KB" ]; then
-    echo "warning: ~/.claude subset is ${kb}KB (limit ${CONFIG_MAX_KB}KB), not copying into the guest." >&2
-    echo "  trim it with CLAUDE_VM_CONFIG_ITEMS, or raise CLAUDE_VM_CONFIG_MAX_KB." >&2
+# --show-config: what a run would copy, without starting anything.
+show_config() {
+  build_config_bundle
+  if [ -z "$CONFIG_BUNDLE" ]; then
+    echo "Nothing would be copied into the guest." >&2
     return 0
   fi
-
-  printf '%s' "$b64"
+  (cd "${CONFIG_TMP}/stage/claude" && find . -type f | sed 's|^\./|~/.claude/|' | LC_ALL=C sort)
 }
 
-# Shell fragment (ending in `&&`) that unpacks the payload from $claude_config
-# into the guest's ~/.claude, or nothing when there is no payload. Only the
-# allowlisted paths are overwritten; the VM's credentials and sessions survive.
-config_restore_cmd() {
-  [ -n "$CONFIG_B64" ] || return 0
-  printf '%s\n' \
-    'mkdir -p "$HOME/.claude" &&' \
-    'printf %s "$claude_config" | base64 -d | tar --warning=no-unknown-keyword -xzf - -C "$HOME/.claude" &&'
-}
-
-# Shell fragment (ending in `&&`) that deletes the CONFIG_STRIP keys from the
-# shipped settings.json and clears the macOS AppleDouble (._*) files the host tar
-# seeds. The JSON edit is done with node, which the node base image always
-# provides, so no jq/python is needed on the host. The key list rides in as an
-# env var; the node program itself is generic (delete whatever keys it's told).
-config_sanitize_cmd() {
-  [ -n "$CONFIG_B64" ] || return 0
-  local js b64 esc
-  if [ -n "$CONFIG_STRIP" ]; then
-    js='const fs=require("fs"),f=process.env.SETTINGS;try{const s=JSON.parse(fs.readFileSync(f,"utf8"));for(const k of (process.env.STRIP||"").split(/\s+/).filter(Boolean))delete s[k];fs.writeFileSync(f,JSON.stringify(s,null,2))}catch(e){}'
-    b64="$(printf '%s' "$js" | base64 | tr -d '\n')"
-    esc="$(printf '%s' "$CONFIG_STRIP" | sed "s/'/'\\\\''/g")"
-    printf '%s\n' \
-      "[ -f \"\$HOME/.claude/settings.json\" ] && printf %s '${b64}' | base64 -d | STRIP='${esc}' SETTINGS=\"\$HOME/.claude/settings.json\" node - || true &&"
+# Resume path: stream the bundle into the VM (msb exec starts a stopped one).
+# If that fails, the session still starts, on the config the VM already has.
+push_config_bundle() {
+  [ -n "$GUEST_BUNDLE" ] || return 0
+  # shellcheck disable=SC2016  # expanded by the guest shell
+  if ! msb exec --stream "$NAME" -- sh -c 'mkdir -p "${1%/*}" && cat > "$1.part" && mv -f "$1.part" "$1"' _ "$GUEST_BUNDLE" < "$CONFIG_BUNDLE"; then
+    echo "warning: could not copy the ~/.claude config into ${NAME}; starting with the config it already has." >&2
+    GUEST_BUNDLE=""
   fi
-  printf '%s\n' \
-    "find \"\$HOME/.claude\" -name '._*' -type f -delete 2>/dev/null || true &&"
+}
+
+# Guest side (POSIX sh, runs before claude or the shell starts): unpack the
+# bundle at $cfg into a scratch dir, check it against its manifest, and only
+# then replace the managed entries of ~/.claude. Managed = what this bundle
+# lists plus what the previous one did, so entries dropped on the host (or no
+# longer shipped, like hooks/) disappear from the guest too. A bundle that fails
+# the check leaves the previous config untouched. Read via `read -r -d ''` for
+# the same bash-3.2 reason as the clipboard shim above.
+IFS= read -r -d '' GUEST_CONFIG_ACTIVATE_SRC <<'EOA' || true
+if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+  st="${VM_CLAUDE_STATE:-/var/lib/vm-claude}"
+  new="$st/config.new.$$"
+  ok=0
+  rm -rf "$new" && mkdir -p "$new" "$HOME/.claude" \
+    && tar -xzf "$cfg" -C "$new" --no-same-owner 2>/dev/null \
+    && [ -f "$new/MANIFEST" ] && [ -d "$new/claude" ] \
+    && [ "$(sed -n 's/^files //p' "$new/MANIFEST")" = "$(find "$new/claude" -type f | wc -l | tr -d ' ')" ] \
+    && [ "$(sed -n 's/^bytes //p' "$new/MANIFEST")" = "$(find "$new/claude" -type f -exec cat {} + 2>/dev/null | wc -c | tr -d ' ')" ] \
+    && ok=1
+  if [ "$ok" = 1 ]; then
+    prev="$(cat "$st/managed" 2>/dev/null || echo 'CLAUDE.md settings.json keybindings.json agents commands skills hooks output-styles')"
+    cur="$(sed -n 's/^item //p' "$new/MANIFEST")"
+    for item in $(printf '%s\n' $prev $cur | sort -u); do
+      case "$item" in .|..|*/*|*[!A-Za-z0-9._-]*) continue ;; esac
+      rm -rf "$HOME/.claude/$item"
+      if [ -e "$new/claude/$item" ]; then mv "$new/claude/$item" "$HOME/.claude/$item"; fi
+    done
+    printf '%s\n' $cur > "$st/managed"
+    find "$HOME/.claude" -name '._*' -type f -delete 2>/dev/null
+  else
+    echo "vm-claude: the ~/.claude config bundle failed its integrity check; keeping the previous config." >&2
+  fi
+  rm -rf "$new" "$cfg"
+fi
+# Bundles left behind by sessions that never got this far (killed mid-start).
+find "${VM_CLAUDE_STATE:-/var/lib/vm-claude}/inbox" -name 'config-*' -mmin +60 -delete 2>/dev/null
+EOA
+
+# --- host git on a guest-writable repo -------------------------------------
+# /workspace IS the host repo, .git included, and the guest can write all of it.
+# Git honours a repo's own .git/config and hooks, so whatever the guest plants
+# there -- core.fsmonitor, core.hooksPath, hooks/*, gpg.*program, filter drivers
+# -- runs on the HOST, as the host user, the next time host git touches the repo.
+# So every git call vm-claude makes on the mounted repo goes through hgit, which
+# switches off the two paths that fire on ordinary commands. The riskier
+# operations (signing, checkout) get their own handling below.
+hgit() {
+  git -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
+# Absolute, physical path of the repo's common git dir -- where config, hooks
+# and objects live, shared by every linked worktree. $1 = a path in the repo.
+git_common_dir() {
+  local d
+  d="$(hgit -C "$1" rev-parse --git-common-dir 2>/dev/null)" || return 1
+  case "$d" in /*) ;; *) d="$1/$d" ;; esac
+  (cd "$d" 2>/dev/null && pwd -P)
+}
+
+# Repo-local config keys that make git run a program (or pull in more config).
+GIT_EXEC_KEYS='^(core\.(fsmonitor|hookspath|sshcommand|editor|pager|askpass|gitproxy|alternaterefscommand|attributesfile|worktree)|sequence\.editor|pager\..*|gpg\..*program|gpg\.ssh\.defaultkeycommand|diff\.external|diff\..*\.(command|textconv)|merge\..*\.driver|(diff|merge)tool\..*\.(cmd|path)|filter\..*\.(clean|smudge|process)|credential\..*|alias\..*|include\.path|includeif\..*\.path|remote\..*\.(uploadpack|receivepack|vcs)|protocol\..*\.allow|submodule\..*\.update|sendemail\..*cmd|(browser|man)\..*\.(cmd|path)|web\.browser)$'
+
+# The repo's config files, as git reads them for this repo: the common config,
+# plus per-worktree config.worktree files. $1 = common git dir.
+git_config_files() {
+  local f
+  for f in "$1/config" "$1/config.worktree" "$1"/worktrees/*/config.worktree; do
+    [ -f "$f" ] && printf '%s\n' "$f"
+  done
+  return 0
+}
+
+# Everything in the repo that would make host git execute something: matching
+# config entries and live hooks. One "name<TAB>checksum" line each, so two
+# snapshots diff cleanly without printing values (a local url.*.insteadOf or
+# credential entry can hold a token). $1 = common git dir.
+git_exec_snapshot() {
+  local common="$1" f entry key hp p
+  while IFS= read -r f; do
+    git config --file "$f" -z --get-regexp "$GIT_EXEC_KEYS" 2>/dev/null \
+      | while IFS= read -r -d '' entry; do
+          key="${entry%%$'\n'*}"
+          printf '%s\t%s\n' "$key" "$(printf '%s' "$entry" | cksum | cut -d' ' -f1)"
+        done
+  done < <(git_config_files "$common")
+
+  hp="$(git config --file "$common/config" --get core.hookspath 2>/dev/null || true)"
+  case "$hp" in ''|/*) ;; *) hp="${HOST_GIT_WORKTREE}/${hp}" ;; esac
+  for p in "$common/hooks" ${hp:+"$hp"}; do
+    [ -d "$p" ] || continue
+    find "$p" -maxdepth 1 \( -type f -o -type l \) ! -name '*.sample' 2>/dev/null \
+      | while IFS= read -r f; do
+          printf 'hook %s\t%s\n' "$f" "$(cksum < "$f" 2>/dev/null | cut -d' ' -f1)"
+        done
+  done
+  return 0
+}
+
+# Snapshot the repo before the VM runs; report on exit anything the session
+# added or changed. It can't undo it (the user may have meant it, e.g. a hook
+# manager), but it stops a planted fsmonitor or hook from going unnoticed until
+# the next host `git status` runs it.
+GIT_AUDIT_COMMON=""
+GIT_AUDIT_BEFORE=""
+arm_git_audit() {
+  command -v git >/dev/null 2>&1 || return 0
+  GIT_AUDIT_COMMON="$(git_common_dir "$HOST_GIT_WORKTREE")" || { GIT_AUDIT_COMMON=""; return 0; }
+  GIT_AUDIT_BEFORE="$(git_exec_snapshot "$GIT_AUDIT_COMMON")"
+  ensure_traps
+}
+
+report_git_audit() {
+  [ -n "$GIT_AUDIT_COMMON" ] || return 0
+  local changed
+  changed="$(comm -13 <(printf '%s\n' "$GIT_AUDIT_BEFORE" | LC_ALL=C sort) \
+                      <(git_exec_snapshot "$GIT_AUDIT_COMMON" | LC_ALL=C sort) \
+             | cut -f1 | LC_ALL=C sort -u)"
+  [ -n "$changed" ] || return 0
+  echo "warning: this session added or changed executable git config in ${GIT_AUDIT_COMMON}:" >&2
+  printf '%s\n' "$changed" | sed 's/^/  /' >&2
+  echo "  Host git runs these on your next git command in this repo. Review them first:" >&2
+  echo "    git config --file '${GIT_AUDIT_COMMON}/config' --list; ls -la '${GIT_AUDIT_COMMON}/hooks'" >&2
 }
 
 # --- sign the VM's commits, on the host ------------------------------------
 # /workspace IS the host repo (we mount the git root), so commits made in the
-# guest are already real objects in the host's .git — they just carry no
+# guest are already real objects in the host's .git -- they just carry no
 # signature, because no signing key is ever copied in. Re-create them out here,
-# where the key lives. --force-rebase is required: a plain rebase onto an
-# ancestor fast-forwards, re-creates nothing, and so signs nothing.
+# where the key lives.
 host_head() {
-  git -C "$HOST_GIT_WORKTREE" rev-parse HEAD 2>/dev/null || true
+  hgit -C "$HOST_GIT_WORKTREE" rev-parse HEAD 2>/dev/null || true
 }
 
+# Signing settings, read from the host's GLOBAL git config when the hook is
+# armed (before the VM runs) and handed explicitly to the signing git. Never
+# read from the repo: its .git/config is guest-writable, and a gpg.program or
+# gpg.ssh.program there names the program host git would run to sign.
+SIGN_CFG=()
+capture_sign_config() {
+  local k v
+  SIGN_CFG=()
+  for k in user.name user.email user.signingkey gpg.format gpg.program \
+           gpg.openpgp.program gpg.ssh.program gpg.x509.program gpg.ssh.defaultKeyCommand; do
+    v="$(git -C "$HOST_GIT_WORKTREE" config --global --includes --get "$k" 2>/dev/null)" || continue
+    SIGN_CFG+=(-c "${k}=${v}")
+  done
+}
+
+# Re-create every commit in $3..$4, signed, keeping each tree, author, date and
+# message, and mapping parents (so merges survive). Prints the new tip.
+#
+# Runs in a throwaway GIT_DIR ($1) that shares only the repo's object store
+# ($2): that git has no repo config and no hooks, so nothing the guest wrote
+# into .git can run. Signing config comes solely from SIGN_CFG.
+sign_commit_range() (
+  local tmp="$1" objects="$2" before="$3" after="$4"
+  local c rest p np tree ident name email date new="" map="$1/map"
+  local parents
+  unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES
+  git init -q --bare --template= "$tmp" >/dev/null 2>&1 || exit 1
+  export GIT_DIR="$tmp" GIT_OBJECT_DIRECTORY="$objects"
+  cd "$tmp" || exit 1
+  export LC_ALL=C
+  : > "$map"
+
+  git rev-list --reverse --topo-order --parents "${before}..${after}" > "$tmp/list" || exit 1
+  while read -r c rest; do
+    tree="$(git rev-parse "${c}^{tree}")" || exit 1
+    parents=()
+    for p in $rest; do
+      np="$(awk -v k="$p" '$1 == k { print $2 }' "$map")"
+      parents+=(-p "${np:-$p}")
+    done
+    ident="$(git cat-file commit "$c" | sed -n '/^$/q; s/^author //p')" || exit 1
+    name="${ident%% <*}"
+    email="${ident#* <}"; email="${email%%>*}"
+    date="${ident##*> }"
+    new="$(git cat-file commit "$c" | sed '1,/^$/d' \
+      | GIT_AUTHOR_NAME="$name" GIT_AUTHOR_EMAIL="$email" GIT_AUTHOR_DATE="$date" \
+        git ${SIGN_CFG[@]+"${SIGN_CFG[@]}"} commit-tree -S "$tree" ${parents[@]+"${parents[@]}"})" || exit 1
+    printf '%s %s\n' "$c" "$new" >> "$map"
+  done < "$tmp/list"
+  [ -n "$new" ] || exit 1
+  printf '%s\n' "$new"
+)
+
 sign_new_commits() {
-  local before="$1" after branch n
+  local before="$1" after branch n common tmp new
   after="$(host_head)"
 
   if [ -z "$before" ] || [ -z "$after" ]; then
@@ -627,7 +917,7 @@ sign_new_commits() {
     return 0
   fi
 
-  branch="$(git -C "$HOST_GIT_WORKTREE" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  branch="$(hgit -C "$HOST_GIT_WORKTREE" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
   if [ -z "$branch" ]; then
     echo "sign-on-exit: HEAD is detached, skipping." >&2
     echo "  sign manually: git -C '${HOST_GIT_WORKTREE}' rebase -f -S ${before}" >&2
@@ -636,32 +926,47 @@ sign_new_commits() {
 
   # If claude rebased or reset rather than just committing, $before is no
   # longer an ancestor and rewriting from it would discard work. Bail instead.
-  if ! git -C "$HOST_GIT_WORKTREE" merge-base --is-ancestor "$before" "$after" 2>/dev/null; then
+  if ! hgit -C "$HOST_GIT_WORKTREE" merge-base --is-ancestor "$before" "$after" 2>/dev/null; then
     echo "sign-on-exit: history diverged from ${before}, skipping to avoid rewriting it." >&2
     return 0
   fi
 
-  n="$(git -C "$HOST_GIT_WORKTREE" rev-list --count "${before}..${after}" 2>/dev/null || echo 0)"
+  if ! common="$(git_common_dir "$HOST_GIT_WORKTREE")"; then
+    echo "sign-on-exit: could not locate the git dir of ${HOST_GIT_WORKTREE}, skipping." >&2
+    return 0
+  fi
+
+  n="$(hgit -C "$HOST_GIT_WORKTREE" rev-list --count "${before}..${after}" 2>/dev/null || echo 0)"
   echo "sign-on-exit: signing ${n} new commit(s) on ${branch}..." >&2
 
-  if git -C "$HOST_GIT_WORKTREE" rebase --force-rebase --gpg-sign --autostash "$before" >/dev/null 2>&1; then
-    echo "sign-on-exit: done, ${branch} is now $(git -C "$HOST_GIT_WORKTREE" rev-parse --short HEAD)." >&2
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/vm-claude-sign.XXXXXX")"
+  # update-ref with the old value is a compare-and-swap: if the branch moved
+  # while we were signing, nothing is overwritten. Same trees, so the index and
+  # working tree (uncommitted work included) are left exactly as they were.
+  if new="$(sign_commit_range "$tmp" "${common}/objects" "$before" "$after")" \
+     && hgit -C "$HOST_GIT_WORKTREE" update-ref -m "vm-claude: sign-on-exit" \
+          "refs/heads/${branch}" "$new" "$after"; then
+    echo "sign-on-exit: done, ${branch} is now $(hgit -C "$HOST_GIT_WORKTREE" rev-parse --short HEAD)." >&2
   else
-    git -C "$HOST_GIT_WORKTREE" rebase --abort >/dev/null 2>&1 || true
-    echo "sign-on-exit: rebase failed, nothing rewritten." >&2
+    echo "sign-on-exit: signing failed, nothing rewritten." >&2
     echo "  retry manually: git -C '${HOST_GIT_WORKTREE}' rebase -f -S ${before}" >&2
+    echo "  (review .git/config and .git/hooks first -- the VM could write them)" >&2
   fi
+  rm -rf "$tmp"
 }
 
-# A single exit path shared by --sign-on-exit and the clipboard watcher: the
-# EXIT trap does the work; the signal traps just turn a signal into an exit so it
-# runs exactly once whichever way we go down (clean /q, Ctrl-C, closed terminal).
+# A single exit path shared by --sign-on-exit, the git audit and the clipboard
+# watcher: the EXIT trap does the work; the signal traps just turn a signal into
+# an exit so it runs exactly once whichever way we go down (clean /q, Ctrl-C,
+# closed terminal).
 TRAPS_SET=0
 on_exit() {
   if [ "$SIGN_ON_EXIT" = "1" ] && [ -n "$HEAD_BEFORE" ]; then
     sign_new_commits "$HEAD_BEFORE"
   fi
+  report_git_audit || true
   [ -n "$WATCHER_PID" ] && kill "$WATCHER_PID" 2>/dev/null || true
+  [ -n "$CONFIG_TMP" ] && rm -rf "$CONFIG_TMP" 2>/dev/null || true
 }
 ensure_traps() {
   [ "$TRAPS_SET" = "1" ] && return 0
@@ -683,11 +988,13 @@ arm_sign_on_exit() {
     echo "sign-on-exit: no HEAD in ${HOST_GIT_WORKTREE} to compare against, not arming." >&2
     return 0
   fi
-  if [ -z "$(git -C "$HOST_GIT_WORKTREE" config --get user.signingkey 2>/dev/null)" ]; then
-    echo "warning: --sign-on-exit given but user.signingkey is unset on the host." >&2
-  fi
+  capture_sign_config
+  case " ${SIGN_CFG[*]-} " in
+    *" user.signingkey="*) ;;
+    *) echo "warning: --sign-on-exit given but user.signingkey is unset in the host's global git config." >&2 ;;
+  esac
 
-  echo "sign-on-exit: armed at $(git -C "$HOST_GIT_WORKTREE" rev-parse --short HEAD)." >&2
+  echo "sign-on-exit: armed at $(hgit -C "$HOST_GIT_WORKTREE" rev-parse --short HEAD)." >&2
   # Sign on a clean /q, and also when the session is interrupted or its terminal
   # is closed -- Ctrl-C, SIGTERM, SIGHUP. The signal traps only exit; the EXIT
   # trap does the signing, so it runs exactly once whichever way we go down.
@@ -776,33 +1083,63 @@ clip_wipe() {
 ensure_worktree() {
   [ -n "$WORKTREE_NAME" ] || return 0
 
+  # Everything under the repo root is guest-writable, so a previous session could
+  # have swapped the holder dir or the worktree itself for a symlink to anywhere
+  # on the host -- and the checkout and file copy below would then write there.
+  local p
+  for p in "${MOUNT_DIR}/${WORKTREE_SUBDIR}" "$WT_HOST"; do
+    if [ -L "$p" ]; then
+      echo "worktree: refusing to use ${p}: it is a symlink (the VM can create those)." >&2
+      return 1
+    fi
+  done
+
   # Already there -> attach, nothing to do (the copy is create-only).
   [ -e "$WT_HOST/.git" ] && return 0
+
+  # Checkout runs filter drivers (smudge/process commands) named in the repo's
+  # own config, and -c can't switch those off without knowing their names. That
+  # config is guest-writable, so refuse rather than run one on the host. Includes
+  # are refused too: they could pull in a filter from a guest-written file.
+  local common risky f
+  common="$(git_common_dir "$MOUNT_DIR")" || common="${MOUNT_DIR}/.git"
+  risky="$(git_config_files "$common" | while IFS= read -r f; do
+    git config --file "$f" --name-only --get-regexp \
+      '^(filter\..*\.(smudge|clean|process)|include\.path|includeif\..*\.path)$' 2>/dev/null || true
+  done)"
+  if [ -n "$risky" ]; then
+    echo "worktree: refusing to create '${WORKTREE_NAME}': this repo's own git config defines" >&2
+    echo "  commands that a checkout would run on the host:" >&2
+    printf '%s\n' "$risky" | sed 's/^/    /' >&2
+    echo "  Review ${common}/config (the VM can write it), remove what you don't recognise, and re-run." >&2
+    return 1
+  fi
 
   echo "worktree: creating '${WORKTREE_NAME}' at ${WT_HOST}..." >&2
   mkdir -p "${MOUNT_DIR}/${WORKTREE_SUBDIR}"
 
   # Keep the worktree holder out of the main repo's status. info/exclude is local
-  # (uncommitted), unlike .gitignore -- append the line once, idempotently.
-  local excl="${MOUNT_DIR}/.git/info/exclude"
-  if [ -f "$excl" ] && ! grep -qxF "/${WORKTREE_SUBDIR}/" "$excl"; then
+  # (uncommitted), unlike .gitignore -- append the line once, idempotently. Not
+  # through a symlink: that would append to whatever host file it points at.
+  local excl="${common}/info/exclude"
+  if [ -f "$excl" ] && [ ! -L "$excl" ] && ! grep -qxF "/${WORKTREE_SUBDIR}/" "$excl"; then
     printf '/%s/\n' "$WORKTREE_SUBDIR" >> "$excl"
   fi
 
   # Relative pointer files (git >= 2.48) so the links survive the host->guest
   # path remap. Older git: fall back to a plain add and relativize by hand below.
   local relflag="" rel_fallback=0
-  if git worktree add -h 2>&1 | grep -q 'relative-paths'; then
+  if hgit worktree add -h 2>&1 | grep -q 'relative-paths'; then
     relflag="--relative-paths"
   else
     rel_fallback=1
     echo "worktree: host git lacks --relative-paths; relativizing links by hand." >&2
   fi
 
-  if git -C "$MOUNT_DIR" show-ref --verify --quiet "refs/heads/${WORKTREE_NAME}"; then
-    git -C "$MOUNT_DIR" worktree add $relflag "$WT_HOST" "$WORKTREE_NAME"
+  if hgit -C "$MOUNT_DIR" show-ref --verify --quiet "refs/heads/${WORKTREE_NAME}"; then
+    hgit -C "$MOUNT_DIR" worktree add $relflag "$WT_HOST" "$WORKTREE_NAME"
   else
-    git -C "$MOUNT_DIR" worktree add $relflag -b "$WORKTREE_NAME" "$WT_HOST"
+    hgit -C "$MOUNT_DIR" worktree add $relflag -b "$WORKTREE_NAME" "$WT_HOST"
   fi
 
   # Fallback relativization: rewrite the forward gitfile and the back-pointer to
@@ -823,8 +1160,8 @@ ensure_worktree() {
   # pathspec exclusion won't drop, so it gets copied in -- then removed right
   # after, so the worktree never ends up nested inside itself.
   if command -v tar >/dev/null 2>&1; then
-    { git -C "$MOUNT_DIR" ls-files -z --others --exclude-standard
-      git -C "$MOUNT_DIR" ls-files -z --others --ignored --exclude-standard; } \
+    { hgit -C "$MOUNT_DIR" ls-files -z --others --exclude-standard
+      hgit -C "$MOUNT_DIR" ls-files -z --others --ignored --exclude-standard; } \
       | tar -C "$MOUNT_DIR" --null -T - -cf - 2>/dev/null \
       | tar -C "$WT_HOST" -xf - 2>/dev/null \
       && echo "worktree: copied gitignored/untracked files into ${WORKTREE_NAME}." >&2 \
@@ -841,72 +1178,71 @@ worktree_safe_dir_cmd() {
   printf "git config --global --add safe.directory '%s' &&\n" "$GUEST_WORKDIR"
 }
 
-# $1 is the (possibly empty) config payload; the rest is claude's own argv.
-boot_cmd() {
+# The one guest setup script, shared by a fresh boot, a resume and --shell, so
+# every entry path gets the same config, tools and environment. Positional args:
+# $1 guest workdir, $2 timezone, $3 config bundle path in the guest (or ""), and
+# the rest is the command to exec at the end (claude + its args, or a shell).
+# Values ride in as args rather than being spliced into the script text.
+guest_prepare_script() {
   cat <<EOF
-claude_config="\$1" && shift &&
-apt-get update &&
-apt-get install -y --no-install-recommends ca-certificates git tzdata &&
-$(tz_setup_cmd)
-git config --global --add safe.directory /workspace &&
-$(worktree_safe_dir_cmd)
-$(host_git_config)
-npm install -g @anthropic-ai/claude-code@${VERSION} &&
-$(config_restore_cmd)
-$(config_sanitize_cmd)
-$(clip_guest_setup_cmd)
+cd "\$1" || exit 1
+[ -n "\$2" ] && export TZ="\$2"
+cfg="\$3"
+shift 3
+if ! command -v git >/dev/null 2>&1; then
+  echo "vm-claude: first boot, installing base packages..." >&2
+  { apt-get update &&
+    apt-get install -y --no-install-recommends ca-certificates git tzdata &&
+    $(tz_setup_cmd)
+    git config --global --add safe.directory /workspace &&
+    $(host_git_config)
+    true; } || exit 1
+fi
+$(worktree_safe_dir_cmd) true
+if command -v claude >/dev/null 2>&1; then
+  echo "Updating claude (@${VERSION})..." >&2
+  npm install -g @anthropic-ai/claude-code@${VERSION} --no-fund --no-audit --loglevel=error || echo "vm-claude: claude update failed; using the version already installed." >&2
+else
+  npm install -g @anthropic-ai/claude-code@${VERSION} --no-fund --no-audit --loglevel=error || exit 1
+fi
+${GUEST_CONFIG_ACTIVATE_SRC}
+$(clip_guest_setup_cmd) true
 $(clip_ready_check_cmd)
-export IS_SANDBOX=1 &&
-exec claude "\$@"
+export IS_SANDBOX=1
+exec "\$@"
 EOF
 }
 
+# Boot a new VM and run "$@" in it after guest_prepare_script.
 start_fresh() {
   local ceiling=""
   if [ "$CEILING_SET" = "1" ]; then
     ceiling=", up to ${MAX_CPUS} cpu / ${MAX_MEMORY}"
   fi
   echo "Booting new microVM '${NAME}' (image ${IMAGE}, ${CPUS} cpu / ${MEMORY} ram / ${DISK} disk${ceiling})..." >&2
-  local clip_mount=()
+  local clip_mount=() copy=()
   if [ "$CLIP_ENABLE" = "1" ]; then
     clip_mount=(--mount-dir "${CLIP_SHARED}:/run/vm-clip:rw")
+  fi
+  if [ -n "$GUEST_BUNDLE" ]; then
+    copy=(--copy-file "${CONFIG_BUNDLE}:${GUEST_BUNDLE}")
   fi
   msb run -t --name "$NAME" --replace \
     --cpus "$CPUS" --memory "$MEMORY" --root-disk "$DISK" \
     ${MAX_FLAGS[@]+"${MAX_FLAGS[@]}"} \
     --mount-dir "${MOUNT_DIR}:/workspace:rw" \
     ${clip_mount[@]+"${clip_mount[@]}"} \
+    ${copy[@]+"${copy[@]}"} \
     --workdir "$GUEST_WORKDIR" \
-    "$IMAGE" -- sh -lc "$(boot_cmd)" _ "$CONFIG_B64" "$@"
+    "$IMAGE" -- sh -lc "$(guest_prepare_script)" _ "$GUEST_WORKDIR" "$TZ_NAME" "$GUEST_BUNDLE" "$@"
 }
 
-# TZ and the config payload are passed as positional args rather than spliced
-# into the script text. The config is re-applied on every resume, so edits to
-# the host's ~/.claude show up next run (and overwrite the guest's copy).
+# Run "$@" in the existing VM after guest_prepare_script. The config is re-sent
+# on every resume, so edits to the host's ~/.claude show up next run.
 resume() {
   echo "Resuming microVM '${NAME}'..." >&2
-  local script
-  script=$(cat <<EOF
-cd "\$1" || exit 1; shift
-[ -n "\$1" ] && export TZ="\$1"; shift
-if [ -n "\$1" ]; then
-  mkdir -p "\$HOME/.claude" &&
-  printf %s "\$1" | base64 -d | tar --warning=no-unknown-keyword -xzf - -C "\$HOME/.claude" &&
-  $(config_sanitize_cmd)
-  true
-fi
-shift
-$(worktree_safe_dir_cmd) true
-echo "Updating claude (@${VERSION})..." >&2
-npm install -g @anthropic-ai/claude-code@${VERSION} --no-fund --no-audit --loglevel=error \
-  || echo "vm-claude: claude update failed; using the version already installed." >&2
-$(clip_guest_setup_cmd)
-$(clip_ready_check_cmd)
-export IS_SANDBOX=1
-exec claude "\$@"
-EOF
-)
-  msb exec -t "$NAME" -- sh -lc "$script" _ "$GUEST_WORKDIR" "$TZ_NAME" "$CONFIG_B64" "$@"
+  push_config_bundle
+  msb exec -t "$NAME" -- sh -lc "$(guest_prepare_script)" _ "$GUEST_WORKDIR" "$TZ_NAME" "$GUEST_BUNDLE" "$@"
 }
 
 main() {
@@ -916,6 +1252,7 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --shell) mode="shell"; shift ;;
+      --show-config) mode="show-config"; shift ;;
       --stop)  mode="stop";  shift ;;
       --rm)    mode="rm";    shift ;;
       --sign-on-exit)    SIGN_ON_EXIT=1; shift ;;
@@ -940,6 +1277,12 @@ main() {
     esac
   done
 
+  # Needs neither msb nor a VM: just shows what a run would copy.
+  if [ "$mode" = show-config ]; then
+    show_config
+    return 0
+  fi
+
   resolve_limits
   ensure_msb
 
@@ -961,47 +1304,33 @@ main() {
       msb remove "$NAME" 2>/dev/null || msb rm "$NAME"
       clip_wipe
       echo "Removed ${NAME} (state wiped)." ;;
-    shell)
-      ensure_worktree
-      arm_sign_on_exit
-      start_watcher
-      local clip_mount=()
-      if [ "$CLIP_ENABLE" = "1" ]; then
-        clip_mount=(--mount-dir "${CLIP_SHARED}:/run/vm-clip:rw")
-      fi
-      if vm_exists; then
-        if [ "$RESIZE" = "1" ]; then apply_resize; fi
-        msb exec -t "$NAME" -- sh -lc "$(clip_guest_setup_cmd)export IS_SANDBOX=1; exec sh -l"
-      else
-        msb run -t --name "$NAME" --replace \
-          --cpus "$CPUS" --memory "$MEMORY" --root-disk "$DISK" \
-          ${MAX_FLAGS[@]+"${MAX_FLAGS[@]}"} \
-          --mount-dir "${MOUNT_DIR}:/workspace:rw" \
-          ${clip_mount[@]+"${clip_mount[@]}"} \
-          --workdir "$GUEST_WORKDIR" \
-          "$IMAGE" -- sh -lc "$(clip_guest_setup_cmd)export IS_SANDBOX=1; exec sh -l"
-      fi ;;
-    run)
+    shell|run)
       # The microVM is already the sandbox: only the project dir is visible and
       # everything else in the guest is throwaway. So run claude unattended by
       # default; IS_SANDBOX=1 in the guest is what lets the flag work as root.
-      CONFIG_B64="$(build_config_payload)"
-      if [ "$SKIP_PERMISSIONS" != "0" ]; then
-        passthru=(--dangerously-skip-permissions ${passthru[@]+"${passthru[@]}"})
+      local cmd=(sh -l)
+      if [ "$mode" = run ]; then
+        if [ "$SKIP_PERMISSIONS" != "0" ]; then
+          passthru=(--dangerously-skip-permissions ${passthru[@]+"${passthru[@]}"})
+        fi
+        cmd=(claude ${passthru[@]+"${passthru[@]}"})
       fi
       ensure_worktree
       arm_sign_on_exit
+      arm_git_audit
+      build_config_bundle
       start_watcher
       if vm_exists; then
         if [ "$RESIZE" = "1" ]; then apply_resize; fi
-        resume ${passthru[@]+"${passthru[@]}"}
+        resume "${cmd[@]}"
       else
         if [ "$RESIZE" = "1" ]; then
           echo "vm-claude: no VM for this project yet -- booting one at the requested size." >&2
         fi
-        start_fresh ${passthru[@]+"${passthru[@]}"}
+        start_fresh "${cmd[@]}"
       fi ;;
   esac
 }
 
-main "$@"
+# test/run.sh sources this file to exercise the host-side functions directly.
+[ "${VM_CLAUDE_SOURCED:-0}" = 1 ] || main "$@"
