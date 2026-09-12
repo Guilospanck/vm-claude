@@ -22,6 +22,15 @@ Drop the script somewhere on your `PATH` and make it executable:
 install -m 755 vm-claude ~/.local/bin/vm-claude
 ```
 
+Or, from a checkout, with [`just`](https://github.com/casey/just):
+
+```bash
+just install              # copy this checkout's vm-claude to ~/.local/bin
+just tag 1.2.0 ["notes"]  # lint + test, tag v1.2.0, push it, publish the GitHub Release, then install it
+```
+
+`just tag` only runs from a clean `main` that matches `origin/main`, and stops before tagging if lint or tests fail.
+
 ## Usage
 
 ```bash
